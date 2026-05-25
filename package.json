@@ -1,0 +1,18 @@
+{
+  "name": "noxarianet-bot-baileys",
+  "version": "1.2.0",
+  "description": "Bot WhatsApp NoxariaNet Store — Versi Ringan Tanpa Chrome",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "@whiskeysockets/baileys": "^6.5.0",
+    "qrcode-terminal": "^0.12.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "ws": "^8.18.0",
+    "pino": "^8.16.1"
+  }
+}
