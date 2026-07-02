@@ -67,6 +67,73 @@ function formatLicenses(licenses) {
         .join("\n\n");
 }
 
+function parseTargetNote(noteVal) {
+    if (!noteVal) return "-";
+    if (typeof noteVal !== "string") return String(noteVal);
+    
+    const trimmed = noteVal.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        try {
+            const parsed = JSON.parse(trimmed);
+            return parsed.target || parsed.customer_id || trimmed;
+        } catch (e) {
+            // Not valid JSON
+        }
+    }
+    return noteVal;
+}
+
+function formatFulfillmentDetails(order) {
+    const details = order.account_details || {};
+    const rawItems = details.raw_items || [];
+    
+    const h2hItems = rawItems.filter(item => item.order_process === "h2h");
+    const smmItems = rawItems.filter(item => item.order_process === "smm");
+    
+    if (h2hItems.length > 0) {
+        return h2hItems.map((item, i) => {
+            let snList = "-";
+            if (item.h2h_results) {
+                if (Array.isArray(item.h2h_results)) {
+                    snList = item.h2h_results.map(res => res.sn).filter(Boolean).join(", ") || "-";
+                } else if (typeof item.h2h_results === "object") {
+                    snList = item.h2h_results.sn || "-";
+                } else if (typeof item.h2h_results === "string") {
+                    snList = item.h2h_results;
+                }
+            }
+            const target = parseTargetNote(item.note || item.target);
+            return `*Item ${i + 1}:* ${item.product_name} - ${item.variant_name}\n` +
+                   `   - Target: *${target}*\n` +
+                   `   - SN/Ref: *${snList}*\n` +
+                   `   - Status: *Sukses*`;
+        }).join("\n\n");
+    } else if (smmItems.length > 0) {
+        return smmItems.map((item, i) => {
+            const target = parseTargetNote(item.note || item.target);
+            return `*Item ${i + 1}:* ${item.product_name} - ${item.variant_name}\n` +
+                   `   - Target: *${target}*\n` +
+                   `   - Status: *Sukses*`;
+        }).join("\n\n");
+    } else {
+        const licenses = details.licenses || [];
+        if (licenses.length > 0) {
+            return formatLicenses(licenses);
+        }
+    }
+    
+    if (rawItems.length > 0) {
+        return rawItems.map((item, i) => {
+            const target = parseTargetNote(item.note || item.target);
+            return `*Item ${i + 1}:* ${item.variant_name || item.product_name || "Produk Digital"}\n` +
+                   `   - Detail: *${target}*\n` +
+                   `   - Status: *Sukses*`;
+        }).join("\n\n");
+    }
+    
+    return "_Detail akun tidak tersedia. Hubungi admin._";
+}
+
 async function resolveGroupId(sock) {
     if (cachedGroupId) return cachedGroupId;
     try {
@@ -366,17 +433,26 @@ async function startBot() {
                             return;
                         }
                         if (newStatus === "COMPLETED") {
-                            const licenses = (order.account_details || {}).licenses || [];
-                            const akunText = formatLicenses(licenses);
+                            const details = order.account_details || {};
+                            const rawItems = details.raw_items || [];
+                            const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
+                            const fulfillmentText = formatFulfillmentDetails(order);
+                            const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
+                            const footerMsg = isH2H 
+                                ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                  "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                  "Tinggalkan ulasan positif ya Kak!"
+                                : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                  "_Jangan share akun ini ke orang lain!_\n" +
+                                  "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                  "Tinggalkan ulasan positif ya Kak!";
+
                             if (waJid) await sendViaCurrent(waJid,
                                 "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                                 "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
                                 "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "*DETAIL AKUN ANDA:*\n\n" + akunText + "\n\n" +
-                                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "_Jangan share akun ini ke orang lain!_\n" +
-                                "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
-                                "Tinggalkan ulasan positif ya Kak!");
+                                labelDetail + "\n\n" + fulfillmentText + "\n\n" +
+                                footerMsg);
                             try {
                                 const gid = await resolveGroupId(s);
                                 await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + order.wa_number);
@@ -447,16 +523,24 @@ async function startBot() {
                                     "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
                                     "Kami akan langsung kirim detail akun ke sini ya Kak!");
                             } else if (order.status === "COMPLETED") {
-                                const licenses = (order.account_details || {}).licenses || [];
-                                const akunText = formatLicenses(licenses);
+                                const details = order.account_details || {};
+                                const rawItems = details.raw_items || [];
+                                const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
+                                const fulfillmentText = formatFulfillmentDetails(order);
+                                const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
+                                const footerMsg = isH2H 
+                                    ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                      "Terima kasih sudah berbelanja di *noxarianet store*!"
+                                    : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                      "_Jangan share akun ini ke orang lain!_\n" +
+                                      "Terima kasih sudah berbelanja di *noxarianet store*!";
+
                                 if (waJid) await sendViaCurrent(waJid,
                                     "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                                     "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
                                     "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "*DETAIL AKUN ANDA:*\n\n" + akunText + "\n\n" +
-                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "_Jangan share akun ini ke orang lain!_\n" +
-                                    "Terima kasih sudah berbelanja di *noxarianet store*!");
+                                    labelDetail + "\n\n" + fulfillmentText + "\n\n" +
+                                    footerMsg);
                                 try {
                                     const gid = await resolveGroupId(currentSock);
                                     await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + order.wa_number);
