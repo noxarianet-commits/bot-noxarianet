@@ -467,12 +467,21 @@ async function startBot() {
                                     "ID: *" + order.id + "*\n" + order.product + "\nWA: " + order.wa_number + "\n" +
                                     "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*");
                             } catch (e) { console.error("[!] Error notif grup FAILED:", e.message); }
-                            if (waJid) await sendViaCurrent(waJid,
-                                "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
-                                "Tim kami segera menangani masalah ini.\n" +
-                                "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                "Mohon maaf atas ketidaknyamanannya");
+                            if (waJid) {
+                                let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                    "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
+                                    "Tim kami segera menangani masalah ini.\n" +
+                                    "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
+                                    "Mohon maaf atas ketidaknyamanannya";
+                                if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
+                                    failedText = "*MAAF, PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Halo Kak, pesanan Anda dengan ID *" + order.id + "* gagal karena *nomor tujuan salah atau tidak valid*.\n\n" +
+                                        "Saldo telah dikembalikan (refund) ke sistem kami. Silakan hubungi admin di WhatsApp untuk mengoreksi nomor tujuan agar pesanan bisa diproses ulang, atau untuk mengajukan pengembalian dana.\n\n" +
+                                        "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
+                                        "Mohon maaf atas ketidaknyamanannya.";
+                                }
+                                await sendViaCurrent(waJid, failedText);
+                            }
                         }
                     } catch (err) {
                         notifiedOrderIds.delete(notifKey);
@@ -553,12 +562,21 @@ async function startBot() {
                                         "ID: *" + order.id + "*\n" + order.product + "\nWA: " + order.wa_number + "\n" +
                                         "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*");
                                 } catch (e) { console.error("[!] Error notif grup FAILED polling:", e.message); }
-                                if (waJid) await sendViaCurrent(waJid,
-                                    "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
-                                    "Tim kami segera menangani masalah ini.\n" +
-                                    "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                    "Mohon maaf atas ketidaknyamanannya");
+                                if (waJid) {
+                                    let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
+                                        "Tim kami segera menangani masalah ini.\n" +
+                                        "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
+                                        "Mohon maaf atas ketidaknyamanannya";
+                                    if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
+                                        failedText = "*MAAF, PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                            "Halo Kak, pesanan Anda dengan ID *" + order.id + "* gagal karena *nomor tujuan salah atau tidak valid*.\n\n" +
+                                            "Saldo telah dikembalikan (refund) ke sistem kami. Silakan hubungi admin di WhatsApp untuk mengoreksi nomor tujuan agar pesanan bisa diproses ulang, atau untuk mengajukan pengembalian dana.\n\n" +
+                                            "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
+                                            "Mohon maaf atas ketidaknyamanannya.";
+                                    }
+                                    await sendViaCurrent(waJid, failedText);
+                                }
                             }
                         } catch (sendErr) {
                             notifiedOrderIds.delete(notifKey);
