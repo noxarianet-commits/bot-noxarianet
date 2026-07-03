@@ -53,6 +53,22 @@ function formatWaJid(waNumber) {
     return num + "@s.whatsapp.net";
 }
 
+function maskEmail(email) {
+    if (!email || !email.includes("@")) return "-";
+    const [name, domain] = email.split("@");
+    if (name.length <= 2) {
+        return name[0] + "***@" + domain;
+    }
+    return name.slice(0, 2) + "***" + name.slice(-1) + "@" + domain;
+}
+
+function maskPhone(phone) {
+    if (!phone) return "-";
+    const cleaned = phone.toString().replace(/\D/g, "");
+    if (cleaned.length < 8) return cleaned.slice(0, 3) + "****";
+    return cleaned.slice(0, 4) + "****" + cleaned.slice(-4);
+}
+
 function formatLicenses(licenses) {
     if (!licenses || licenses.length === 0)
         return "_Detail akun tidak tersedia. Hubungi admin._";
@@ -400,7 +416,7 @@ async function startBot() {
                         "Harga: *Rp " + Number(order.price || 0).toLocaleString("id-ID") + "*\n" +
                         "Metode: " + (order.payment_method || "-") + "\n" +
                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                        "WA: *" + order.wa_number + "*\nEmail: " + (order.email || "-") + "\n" +
+                        "WA: *" + maskPhone(order.wa_number) + "*\nEmail: " + (order.email ? maskEmail(order.email) : "-") + "\n" +
                         new Date(order.timestamp || Date.now()).toLocaleString("id-ID") + "\n" +
                         "_Menunggu pembayaran..._";
                     try {
@@ -455,7 +471,7 @@ async function startBot() {
                                 footerMsg);
                             try {
                                 const gid = await resolveGroupId(s);
-                                await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + order.wa_number);
+                                await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number));
                             } catch (e) { console.error("[!] Error notif grup COMPLETED:", e.message); }
                             return;
                         }
@@ -464,7 +480,7 @@ async function startBot() {
                                 const gid = await resolveGroupId(s);
                                 await sendViaCurrent(gid,
                                     "*ORDER GAGAL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "ID: *" + order.id + "*\n" + order.product + "\nWA: " + order.wa_number + "\n" +
+                                    "ID: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number) + "\n" +
                                     "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*");
                             } catch (e) { console.error("[!] Error notif grup FAILED:", e.message); }
                             if (waJid) {
@@ -552,14 +568,14 @@ async function startBot() {
                                     footerMsg);
                                 try {
                                     const gid = await resolveGroupId(currentSock);
-                                    await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + order.wa_number);
+                                    await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number));
                                 } catch (e) { console.error("[!] Error notif grup COMPLETED polling:", e.message); }
                             } else if (order.status === "FAILED") {
                                 try {
                                     const gid = await resolveGroupId(currentSock);
                                     await sendViaCurrent(gid,
                                         "*ORDER GAGAL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "ID: *" + order.id + "*\n" + order.product + "\nWA: " + order.wa_number + "\n" +
+                                        "ID: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number) + "\n" +
                                         "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*");
                                 } catch (e) { console.error("[!] Error notif grup FAILED polling:", e.message); }
                                 if (waJid) {
