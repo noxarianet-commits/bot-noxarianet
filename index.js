@@ -7,7 +7,6 @@ const {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore,
 } = require("@whiskeysockets/baileys");
 const { createClient } = require("@supabase/supabase-js");
 const qrcode = require("qrcode-terminal");
@@ -83,6 +82,23 @@ function formatWaJid(waNumber) {
     if (num.startsWith("0")) num = "62" + num.slice(1);
     else if (!num.startsWith("62")) num = "62" + num;
     return num + "@s.whatsapp.net";
+}
+
+async function resolveRealJid(waNumber) {
+    const basicJid = formatWaJid(waNumber);
+    if (!basicJid || !currentSock?.user) return basicJid;
+    try {
+        const num = basicJid.split("@")[0];
+        const [result] = await currentSock.onWhatsApp(num);
+        if (result?.exists && result?.jid) {
+            console.log(`[DEBUG] onWhatsApp resolved: ${num} -> ${result.jid}`);
+            return result.jid;
+        }
+        console.log(`[DEBUG] onWhatsApp: ${num} not found on WhatsApp, using basic JID`);
+    } catch (e) {
+        console.error(`[DEBUG] onWhatsApp error for ${waNumber}:`, e.message);
+    }
+    return basicJid;
 }
 
 function maskEmail(email) {
@@ -201,45 +217,8 @@ async function sendViaCurrent(jid, text) {
         console.error(`[DEBUG] ${errMsg}`);
         throw new Error(errMsg);
     }
-    try {
-        await currentSock.sendMessage(jid, { text });
-        console.log(`[DEBUG] SUCCESS: Message sent to ${jid}`);
-    } catch (err) {
-        console.error(`[DEBUG] ERROR sending to ${jid}:`, err); // Log full error, not just message
-        if (err.message && (err.message.includes("MAC") || err.message.includes("decrypt") || err.message.includes("session"))) {
-            console.log(`[DEBUG] Attempting to repair session for ${jid}...`);
-            try {
-                const num = jid.split('@')[0];
-                const authDir = "auth_info_baileys";
-                if (fs.existsSync(authDir)) {
-                    const files = fs.readdirSync(authDir);
-                    for (const file of files) {
-                        if (file.includes(num)) {
-                            fs.rmSync(`${authDir}/${file}`, { force: true });
-                        }
-                    }
-                }
-                // Clear from memory cache if possible
-                if (currentSock.authState?.keys?.set) {
-                    await currentSock.authState.keys.set({ 'session': { [jid]: null } });
-                }
-            } catch (clearErr) {
-                console.error(`[DEBUG] Failed to clear session files for ${jid}:`, clearErr);
-            }
-            
-            // Wait and retry once
-            await new Promise(r => setTimeout(r, 2000));
-            try {
-                await currentSock.sendMessage(jid, { text });
-                console.log(`[+] Retry successful for ${jid}`);
-            } catch (retryErr) {
-                console.error(`[DEBUG] Retry failed for ${jid}:`, retryErr);
-                throw retryErr;
-            }
-        } else {
-            throw err;
-        }
-    }
+    await currentSock.sendMessage(jid, { text });
+    console.log(`[DEBUG] SUCCESS: Message sent to ${jid}`);
 }
 
 async function startBot() {
@@ -250,10 +229,7 @@ async function startBot() {
         const sock = makeWASocket({
             version,
             logger: pino({ level: "silent" }),
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
-            },
+            auth: state,
             browser: ["noxarianet Bot", "Safari", "5.0"],
             syncFullHistory: false,
         });
@@ -519,8 +495,8 @@ async function startBot() {
                     notifiedOrderIds.add(notifKey);
                     console.log("\n[~] ORDER UPDATE [Realtime]: " + order.id + " -> " + newStatus);
                     console.log("[DEBUG] wa_number from order:", order.wa_number);
-                    const waJid = formatWaJid(order.wa_number);
-                    console.log("[DEBUG] Formatted waJid:", waJid);
+                    const waJid = await resolveRealJid(order.wa_number);
+                    console.log("[DEBUG] Resolved waJid:", waJid);
                     try {
                         if (newStatus === "PROCESSING") {
                             if (waJid) {
@@ -639,8 +615,8 @@ async function startBot() {
                         notifiedOrderIds.add(notifKey);
                         console.log("\n[+] [POLLING] " + order.id + " - " + order.status);
                         console.log("[DEBUG] [POLLING] wa_number from order:", order.wa_number);
-                        const waJid = formatWaJid(order.wa_number);
-                        console.log("[DEBUG] [POLLING] Formatted waJid:", waJid);
+                        const waJid = await resolveRealJid(order.wa_number);
+                        console.log("[DEBUG] [POLLING] Resolved waJid:", waJid);
 
                         try {
                             if (order.status === "PROCESSING") {
