@@ -8,6 +8,7 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
+    makeInMemoryStore,
 } = require("@whiskeysockets/baileys");
 const { createClient } = require("@supabase/supabase-js");
 const qrcode = require("qrcode-terminal");
@@ -18,11 +19,45 @@ const os = require("os");
 const fs = require("fs");
 require("dotenv").config();
 
+const store = makeInMemoryStore({});
+
+function cleanSessionFiles() {
+    const authDir = "auth_info_baileys";
+    if (fs.existsSync(authDir)) {
+        try {
+            const files = fs.readdirSync(authDir);
+            for (const file of files) {
+                if (file !== "creds.json") {
+                    fs.rmSync(authDir + "/" + file, { force: true, recursive: true });
+                }
+            }
+            console.log("[+] Berhasil menghapus file sesi korup (kecuali creds.json).");
+        } catch (e) {
+            console.error("[!] Gagal membersihkan file sesi:", e.message);
+        }
+    }
+}
+
 process.on("unhandledRejection", (reason) => {
-    console.error("[!] Unhandled Rejection:", reason?.message || reason);
+    const errMsg = reason?.message || String(reason);
+    console.error("[!] Unhandled Rejection:", errMsg);
+    if (errMsg.includes("Bad MAC")) {
+        console.log("[!] Mendeteksi Bad MAC error! Membersihkan file session non-creds dan merestart bot...");
+        cleanSessionFiles();
+        console.log("[!] WARNING: Jika error ini terus berulang, pastikan tidak ada instance bot lain yang sedang berjalan menggunakan session yang sama!");
+        setTimeout(() => process.exit(1), 1000);
+    }
 });
+
 process.on("uncaughtException", (err) => {
-    console.error("[!] Uncaught Exception:", err.message);
+    const errMsg = err?.message || String(err);
+    console.error("[!] Uncaught Exception:", errMsg);
+    if (errMsg.includes("Bad MAC")) {
+        console.log("[!] Mendeteksi Bad MAC error! Membersihkan file session non-creds dan merestart bot...");
+        cleanSessionFiles();
+        console.log("[!] WARNING: Jika error ini terus berulang, pastikan tidak ada instance bot lain yang sedang berjalan menggunakan session yang sama!");
+        setTimeout(() => process.exit(1), 1000);
+    }
 });
 
 let supabase;
@@ -181,7 +216,16 @@ async function startBot() {
             },
             browser: ["noxarianet Bot", "Safari", "5.0"],
             syncFullHistory: false,
+            getMessage: async (key) => {
+                if (store) {
+                    const msg = await store.loadMessage(key.remoteJid, key.id);
+                    return msg?.message || undefined;
+                }
+                return undefined;
+            }
         });
+        
+        store.bind(sock.ev);
         currentSock = sock;
         sock.ev.on("creds.update", saveCreds);
 
