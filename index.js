@@ -8,7 +8,6 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
-    makeInMemoryStore,
 } = require("@whiskeysockets/baileys");
 const { createClient } = require("@supabase/supabase-js");
 const qrcode = require("qrcode-terminal");
@@ -19,19 +18,23 @@ const os = require("os");
 const fs = require("fs");
 require("dotenv").config();
 
-const store = makeInMemoryStore({});
-
-function cleanSessionFiles() {
+function cleanSessionFiles(forceFullClean = false) {
     const authDir = "auth_info_baileys";
     if (fs.existsSync(authDir)) {
         try {
             const files = fs.readdirSync(authDir);
             for (const file of files) {
-                if (file !== "creds.json") {
-                    fs.rmSync(authDir + "/" + file, { force: true, recursive: true });
+                if (forceFullClean || file !== "creds.json") {
+                    const filePath = authDir + "/" + file;
+                    fs.rmSync(filePath, { force: true, recursive: true });
+                    console.log("[+] Menghapus file sesi:", file);
                 }
             }
-            console.log("[+] Berhasil menghapus file sesi korup (kecuali creds.json).");
+            if (forceFullClean) {
+                console.log("[+] Berhasil menghapus SEMUA file sesi (termasuk creds.json).");
+            } else {
+                console.log("[+] Berhasil menghapus file sesi korup (kecuali creds.json).");
+            }
         } catch (e) {
             console.error("[!] Gagal membersihkan file sesi:", e.message);
         }
@@ -192,13 +195,19 @@ async function resolveGroupId(sock) {
 }
 
 async function sendViaCurrent(jid, text) {
-    if (!currentSock?.user) throw new Error("Connection not ready");
+    console.log(`[DEBUG] Attempting to send message to: ${jid}`);
+    if (!currentSock?.user) {
+        const errMsg = "Connection not ready";
+        console.error(`[DEBUG] ${errMsg}`);
+        throw new Error(errMsg);
+    }
     try {
         await currentSock.sendMessage(jid, { text });
+        console.log(`[DEBUG] SUCCESS: Message sent to ${jid}`);
     } catch (err) {
-        console.error(`[!] Error sending message to ${jid}:`, err.message);
-        if (err.message.includes("MAC") || err.message.includes("decrypt") || err.message.includes("session")) {
-            console.log(`[!] Attempting to repair session for ${jid}...`);
+        console.error(`[DEBUG] ERROR sending to ${jid}:`, err); // Log full error, not just message
+        if (err.message && (err.message.includes("MAC") || err.message.includes("decrypt") || err.message.includes("session"))) {
+            console.log(`[DEBUG] Attempting to repair session for ${jid}...`);
             try {
                 const num = jid.split('@')[0];
                 const authDir = "auth_info_baileys";
@@ -215,7 +224,7 @@ async function sendViaCurrent(jid, text) {
                     await currentSock.authState.keys.set({ 'session': { [jid]: null } });
                 }
             } catch (clearErr) {
-                console.error(`[!] Failed to clear session files for ${jid}:`, clearErr.message);
+                console.error(`[DEBUG] Failed to clear session files for ${jid}:`, clearErr);
             }
             
             // Wait and retry once
@@ -224,7 +233,7 @@ async function sendViaCurrent(jid, text) {
                 await currentSock.sendMessage(jid, { text });
                 console.log(`[+] Retry successful for ${jid}`);
             } catch (retryErr) {
-                console.error(`[!] Retry failed for ${jid}:`, retryErr.message);
+                console.error(`[DEBUG] Retry failed for ${jid}:`, retryErr);
                 throw retryErr;
             }
         } else {
@@ -247,16 +256,7 @@ async function startBot() {
             },
             browser: ["noxarianet Bot", "Safari", "5.0"],
             syncFullHistory: false,
-            getMessage: async (key) => {
-                if (store) {
-                    const msg = await store.loadMessage(key.remoteJid, key.id);
-                    return msg?.message || undefined;
-                }
-                return undefined;
-            }
         });
-        
-        store.bind(sock.ev);
         currentSock = sock;
         sock.ev.on("creds.update", saveCreds);
 
@@ -380,23 +380,29 @@ async function startBot() {
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update;
             if (qr) {
-                console.clear();
                 console.log("\n=== SCAN QR CODE WHATSAPP ANDA ===\n");
                 qrcode.generate(qr, { small: true });
             }
             if (connection === "close") {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                console.log("[-] Koneksi terputus (" + statusCode + "). Reconnect: " + shouldReconnect);
-                if (shouldReconnect) {
-                    cachedGroupId = null;
-                    setTimeout(() => startBot(), 3000);
-                } else {
-                    try { if (fs.existsSync("auth_info_baileys")) fs.rmSync("auth_info_baileys", { recursive: true, force: true }); } catch (e) {}
-                    setTimeout(() => startBot(), 3000);
+                const errorMsg = lastDisconnect?.error?.message || 'Unknown error';
+                console.log("\n[-] Koneksi terputus!");
+                console.log("    Status Code:", statusCode);
+                console.log("    Error:", errorMsg);
+                
+                // Clean session files for reconnection
+                cleanSessionFiles();
+                
+                let shouldReconnect = true;
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log("    [!] Terdeteksi logout, menghapus semua file auth!");
+                    shouldReconnect = false;
+                    cleanSessionFiles(true); // Clean everything including creds.json
                 }
+                
+                console.log("    [*] Reconnecting in 3 seconds...");
+                setTimeout(() => startBot(), 3000);
             } else if (connection === "open") {
-                console.clear();
                 console.log("\n=== BOT NOXARIANET AKTIF v5.0 ===\n");
                 try {
                     const groups = await sock.groupFetchAllParticipating();
@@ -512,15 +518,23 @@ async function startBot() {
                     if (notifiedOrderIds.has(notifKey)) return;
                     notifiedOrderIds.add(notifKey);
                     console.log("\n[~] ORDER UPDATE [Realtime]: " + order.id + " -> " + newStatus);
+                    console.log("[DEBUG] wa_number from order:", order.wa_number);
                     const waJid = formatWaJid(order.wa_number);
+                    console.log("[DEBUG] Formatted waJid:", waJid);
                     try {
                         if (newStatus === "PROCESSING") {
-                            if (waJid) await sendViaCurrent(waJid,
-                                "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
-                                "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
-                                "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
-                                "Kami akan langsung kirim detail akun ke sini ya Kak!");
+                            if (waJid) {
+                                console.log("[DEBUG] Sending PROCESSING message to user...");
+                                await sendViaCurrent(waJid,
+                                    "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                    "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
+                                    "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
+                                    "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
+                                    "Kami akan langsung kirim detail akun ke sini ya Kak!"
+                                );
+                            } else {
+                                console.log("[DEBUG] waJid is null, skipping PROCESSING message to user");
+                            }
                             return;
                         }
                         if (newStatus === "COMPLETED") {
@@ -538,14 +552,21 @@ async function startBot() {
                                   "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
                                   "Tinggalkan ulasan positif ya Kak!";
 
-                            if (waJid) await sendViaCurrent(waJid,
-                                "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                                "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                labelDetail + "\n\n" + fulfillmentText + "\n\n" +
-                                footerMsg);
+                            if (waJid) {
+                                console.log("[DEBUG] Sending COMPLETED message to user...");
+                                await sendViaCurrent(waJid,
+                                    "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                    "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
+                                    "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                    labelDetail + "\n\n" + fulfillmentText + "\n\n" +
+                                    footerMsg
+                                );
+                            } else {
+                                console.log("[DEBUG] waJid is null, skipping COMPLETED message to user");
+                            }
                             try {
                                 const gid = await resolveGroupId(s);
+                                console.log("[DEBUG] Sending COMPLETED message to group:", gid);
                                 await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number));
                             } catch (e) { console.error("[!] Error notif grup COMPLETED:", e.message); }
                             return;
@@ -553,12 +574,15 @@ async function startBot() {
                         if (newStatus === "FAILED") {
                             try {
                                 const gid = await resolveGroupId(s);
+                                console.log("[DEBUG] Sending FAILED message to group:", gid);
                                 await sendViaCurrent(gid,
                                     "*ORDER GAGAL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                                     "ID: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number) + "\n" +
-                                    "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*");
+                                    "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*"
+                                );
                             } catch (e) { console.error("[!] Error notif grup FAILED:", e.message); }
                             if (waJid) {
+                                console.log("[DEBUG] Sending FAILED message to user...");
                                 let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                                     "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
                                     "Tim kami segera menangani masalah ini.\n" +
@@ -572,6 +596,8 @@ async function startBot() {
                                         "Mohon maaf atas ketidaknyamanannya.";
                                 }
                                 await sendViaCurrent(waJid, failedText);
+                            } else {
+                                console.log("[DEBUG] waJid is null, skipping FAILED message to user");
                             }
                         }
                     } catch (err) {
@@ -612,16 +638,24 @@ async function startBot() {
 
                         notifiedOrderIds.add(notifKey);
                         console.log("\n[+] [POLLING] " + order.id + " - " + order.status);
+                        console.log("[DEBUG] [POLLING] wa_number from order:", order.wa_number);
                         const waJid = formatWaJid(order.wa_number);
+                        console.log("[DEBUG] [POLLING] Formatted waJid:", waJid);
 
                         try {
                             if (order.status === "PROCESSING") {
-                                if (waJid) await sendViaCurrent(waJid,
-                                    "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
-                                    "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
-                                    "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
-                                    "Kami akan langsung kirim detail akun ke sini ya Kak!");
+                                if (waJid) {
+                                    console.log("[DEBUG] [POLLING] Sending PROCESSING message to user...");
+                                    await sendViaCurrent(waJid,
+                                        "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
+                                        "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
+                                        "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
+                                        "Kami akan langsung kirim detail akun ke sini ya Kak!"
+                                    );
+                                } else {
+                                    console.log("[DEBUG] [POLLING] waJid is null, skipping PROCESSING message");
+                                }
                             } else if (order.status === "COMPLETED") {
                                 const details = order.account_details || {};
                                 const rawItems = details.raw_items || [];
@@ -635,25 +669,35 @@ async function startBot() {
                                       "_Jangan share akun ini ke orang lain!_\n" +
                                       "Terima kasih sudah berbelanja di *noxarianet store*!";
 
-                                if (waJid) await sendViaCurrent(waJid,
-                                    "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                                    "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    labelDetail + "\n\n" + fulfillmentText + "\n\n" +
-                                    footerMsg);
+                                if (waJid) {
+                                    console.log("[DEBUG] [POLLING] Sending COMPLETED message to user...");
+                                    await sendViaCurrent(waJid,
+                                        "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
+                                        "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        labelDetail + "\n\n" + fulfillmentText + "\n\n" +
+                                        footerMsg
+                                    );
+                                } else {
+                                    console.log("[DEBUG] [POLLING] waJid is null, skipping COMPLETED message");
+                                }
                                 try {
                                     const gid = await resolveGroupId(currentSock);
+                                    console.log("[DEBUG] [POLLING] Sending COMPLETED message to group:", gid);
                                     await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number));
                                 } catch (e) { console.error("[!] Error notif grup COMPLETED polling:", e.message); }
                             } else if (order.status === "FAILED") {
                                 try {
                                     const gid = await resolveGroupId(currentSock);
+                                    console.log("[DEBUG] [POLLING] Sending FAILED message to group:", gid);
                                     await sendViaCurrent(gid,
                                         "*ORDER GAGAL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                                         "ID: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number) + "\n" +
-                                        "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*");
+                                        "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*"
+                                    );
                                 } catch (e) { console.error("[!] Error notif grup FAILED polling:", e.message); }
                                 if (waJid) {
+                                    console.log("[DEBUG] [POLLING] Sending FAILED message to user...");
                                     let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                                         "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
                                         "Tim kami segera menangani masalah ini.\n" +
@@ -667,6 +711,8 @@ async function startBot() {
                                             "Mohon maaf atas ketidaknyamanannya.";
                                     }
                                     await sendViaCurrent(waJid, failedText);
+                                } else {
+                                    console.log("[DEBUG] [POLLING] waJid is null, skipping FAILED message to user");
                                 }
                             }
                         } catch (sendErr) {
