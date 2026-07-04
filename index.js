@@ -366,14 +366,11 @@ async function startBot() {
                 console.log("    Status Code:", statusCode);
                 console.log("    Error:", errorMsg);
                 
-                // Clean session files for reconnection
-                cleanSessionFiles();
-                
-                let shouldReconnect = true;
                 if (statusCode === DisconnectReason.loggedOut) {
                     console.log("    [!] Terdeteksi logout, menghapus semua file auth!");
-                    shouldReconnect = false;
                     cleanSessionFiles(true); // Clean everything including creds.json
+                    console.log("    [!] Silakan restart bot dan scan QR ulang.");
+                    return; // Jangan reconnect jika logout
                 }
                 
                 console.log("    [*] Reconnecting in 3 seconds...");
