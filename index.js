@@ -42,10 +42,7 @@ process.on("unhandledRejection", (reason) => {
     const errMsg = reason?.message || String(reason);
     console.error("[!] Unhandled Rejection:", errMsg);
     if (errMsg.includes("Bad MAC")) {
-        console.log("[!] Mendeteksi Bad MAC error! Membersihkan file session non-creds dan merestart bot...");
-        cleanSessionFiles();
-        console.log("[!] WARNING: Jika error ini terus berulang, pastikan tidak ada instance bot lain yang sedang berjalan menggunakan session yang sama!");
-        setTimeout(() => process.exit(1), 1000);
+        console.log("[!] Mendeteksi Bad MAC error di background. Mengabaikan agar bot tetap berjalan...");
     }
 });
 
@@ -53,10 +50,7 @@ process.on("uncaughtException", (err) => {
     const errMsg = err?.message || String(err);
     console.error("[!] Uncaught Exception:", errMsg);
     if (errMsg.includes("Bad MAC")) {
-        console.log("[!] Mendeteksi Bad MAC error! Membersihkan file session non-creds dan merestart bot...");
-        cleanSessionFiles();
-        console.log("[!] WARNING: Jika error ini terus berulang, pastikan tidak ada instance bot lain yang sedang berjalan menggunakan session yang sama!");
-        setTimeout(() => process.exit(1), 1000);
+        console.log("[!] Mendeteksi Bad MAC error di background. Mengabaikan agar bot tetap berjalan...");
     }
 });
 
@@ -199,7 +193,44 @@ async function resolveGroupId(sock) {
 
 async function sendViaCurrent(jid, text) {
     if (!currentSock?.user) throw new Error("Connection not ready");
-    await currentSock.sendMessage(jid, { text });
+    try {
+        await currentSock.sendMessage(jid, { text });
+    } catch (err) {
+        console.error(`[!] Error sending message to ${jid}:`, err.message);
+        if (err.message.includes("MAC") || err.message.includes("decrypt") || err.message.includes("session")) {
+            console.log(`[!] Attempting to repair session for ${jid}...`);
+            try {
+                const num = jid.split('@')[0];
+                const authDir = "auth_info_baileys";
+                if (fs.existsSync(authDir)) {
+                    const files = fs.readdirSync(authDir);
+                    for (const file of files) {
+                        if (file.includes(num)) {
+                            fs.rmSync(`${authDir}/${file}`, { force: true });
+                        }
+                    }
+                }
+                // Clear from memory cache if possible
+                if (currentSock.authState?.keys?.set) {
+                    await currentSock.authState.keys.set({ 'session': { [jid]: null } });
+                }
+            } catch (clearErr) {
+                console.error(`[!] Failed to clear session files for ${jid}:`, clearErr.message);
+            }
+            
+            // Wait and retry once
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+                await currentSock.sendMessage(jid, { text });
+                console.log(`[+] Retry successful for ${jid}`);
+            } catch (retryErr) {
+                console.error(`[!] Retry failed for ${jid}:`, retryErr.message);
+                throw retryErr;
+            }
+        } else {
+            throw err;
+        }
+    }
 }
 
 async function startBot() {
