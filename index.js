@@ -184,7 +184,7 @@ function formatLicenses(licenses) {
 function parseTargetNote(noteVal) {
     if (!noteVal) return "-";
     if (typeof noteVal !== "string") return String(noteVal);
-    
+
     const trimmed = noteVal.trim();
     if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
         try {
@@ -200,10 +200,10 @@ function parseTargetNote(noteVal) {
 function formatFulfillmentDetails(order) {
     const details = order.account_details || {};
     const rawItems = details.raw_items || [];
-    
+
     const h2hItems = rawItems.filter(item => item.order_process === "h2h");
     const smmItems = rawItems.filter(item => item.order_process === "smm");
-    
+
     if (h2hItems.length > 0) {
         return h2hItems.map((item, i) => {
             let snList = "-";
@@ -218,16 +218,16 @@ function formatFulfillmentDetails(order) {
             }
             const target = parseTargetNote(item.note || item.target);
             return `*Item ${i + 1}:* ${item.product_name} - ${item.variant_name}\n` +
-                   `   - Target: *${target}*\n` +
-                   `   - SN/Ref: *${snList}*\n` +
-                   `   - Status: *Sukses*`;
+                `   - Target: *${target}*\n` +
+                `   - SN/Ref: *${snList}*\n` +
+                `   - Status: *Sukses*`;
         }).join("\n\n");
     } else if (smmItems.length > 0) {
         return smmItems.map((item, i) => {
             const target = parseTargetNote(item.note || item.target);
             return `*Item ${i + 1}:* ${item.product_name} - ${item.variant_name}\n` +
-                   `   - Target: *${target}*\n` +
-                   `   - Status: *Sukses*`;
+                `   - Target: *${target}*\n` +
+                `   - Status: *Sukses*`;
         }).join("\n\n");
     } else {
         const licenses = details.licenses || [];
@@ -235,16 +235,16 @@ function formatFulfillmentDetails(order) {
             return formatLicenses(licenses);
         }
     }
-    
+
     if (rawItems.length > 0) {
         return rawItems.map((item, i) => {
             const target = parseTargetNote(item.note || item.target);
             return `*Item ${i + 1}:* ${item.variant_name || item.product_name || "Produk Digital"}\n` +
-                   `   - Detail: *${target}*\n` +
-                   `   - Status: *Sukses*`;
+                `   - Detail: *${target}*\n` +
+                `   - Status: *Sukses*`;
         }).join("\n\n");
     }
-    
+
     return "_Detail akun tidak tersedia. Hubungi admin._";
 }
 
@@ -417,14 +417,14 @@ async function startBot() {
                 console.log("\n[-] Koneksi terputus!");
                 console.log("    Status Code:", statusCode);
                 console.log("    Error:", errorMsg);
-                
+
                 if (statusCode === DisconnectReason.loggedOut) {
                     console.log("    [!] Terdeteksi logout, menghapus semua file auth!");
                     cleanSessionFiles(true); // Clean everything including creds.json
                     console.log("    [!] Silakan restart bot dan scan QR ulang.");
                     return; // Jangan reconnect jika logout
                 }
-                
+
                 console.log("    [*] Reconnecting in 3 seconds...");
                 setTimeout(() => startBot(), 3000);
             } else if (connection === "open") {
@@ -636,14 +636,14 @@ async function startBot() {
                             const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
                             const fulfillmentText = formatFulfillmentDetails(order);
                             const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
-                            const footerMsg = isH2H 
+                            const footerMsg = isH2H
                                 ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                  "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
-                                  "Tinggalkan ulasan positif ya Kak!"
+                                "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                "Tinggalkan ulasan positif ya Kak!"
                                 : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                  "_Jangan share akun ini ke orang lain!_\n" +
-                                  "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
-                                  "Tinggalkan ulasan positif ya Kak!";
+                                "_Jangan share akun ini ke orang lain!_\n" +
+                                "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                "Tinggalkan ulasan positif ya Kak!";
 
                             if (waJid) {
                                 console.log("[DEBUG] Sending COMPLETED message to user...");
@@ -783,12 +783,12 @@ async function startBot() {
                                 const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
                                 const fulfillmentText = formatFulfillmentDetails(order);
                                 const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
-                                const footerMsg = isH2H 
+                                const footerMsg = isH2H
                                     ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                      "Terima kasih sudah berbelanja di *noxarianet store*!"
+                                    "Terima kasih sudah berbelanja di *noxarianet store*!"
                                     : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                      "_Jangan share akun ini ke orang lain!_\n" +
-                                      "Terima kasih sudah berbelanja di *noxarianet store*!";
+                                    "_Jangan share akun ini ke orang lain!_\n" +
+                                    "Terima kasih sudah berbelanja di *noxarianet store*!";
 
                                 if (waJid) {
                                     console.log("[DEBUG] [POLLING] Sending COMPLETED message to user...");
