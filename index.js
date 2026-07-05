@@ -537,21 +537,7 @@ async function startBot() {
                         console.log("[DEBUG] Skipping INSERT notification for old order:", order.id);
                         return;
                     }
-
-                    const notif =
-                        "*ORDER BARU MASUK!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                        "ID: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                        "Varian: " + (order.variant || "-") + "\n" +
-                        "Harga: *Rp " + Number(order.price || 0).toLocaleString("id-ID") + "*\n" +
-                        "Metode: " + (order.payment_method || "-") + "\n" +
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                        "WA: *" + maskPhone(order.wa_number) + "*\nEmail: " + (order.email ? maskEmail(order.email) : "-") + "\n" +
-                        new Date(order.timestamp || Date.now()).toLocaleString("id-ID") + "\n" +
-                        "_Menunggu pembayaran..._";
-                    try {
-                        const groupId = await resolveGroupId(s);
-                        await sendViaCurrent(groupId, notif);
-                    } catch (err) { console.error("[!] Error notif INSERT:", err.message); }
+                    console.log("[DEBUG] Order baru diterima via realtime:", order.id, "- notifikasi grup akan dihandle oleh polling");
                 })
                 .subscribe((status) => console.log("[*] Realtime [INSERT]: " + status));
 
