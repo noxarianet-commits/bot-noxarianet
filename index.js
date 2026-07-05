@@ -73,8 +73,58 @@ let supabaseSubscribed = false;
 let pollingStarted = false;
 let currentSock = null;
 let cachedGroupId = null;
+let orderNotificationsReady = false;
+let botActivationTime = null;
 const targetGroupId = "120363424077781671@g.us";
 const notifiedOrderIds = new Set();
+
+function setOrderNotificationsReady(isReady, reason = "") {
+    orderNotificationsReady = isReady;
+    const label = isReady ? "READY" : "BLOCKED";
+    const suffix = reason ? " - " + reason : "";
+    console.log(`[DEBUG] Order notifications: ${label}${suffix}`);
+}
+
+function isOrderNotificationReady() {
+    return Boolean(orderNotificationsReady && currentSock?.user);
+}
+
+function setBotActivationTime(now = new Date()) {
+    if (botActivationTime) return botActivationTime;
+    const activationDate = now instanceof Date ? now : new Date(now);
+    if (Number.isNaN(activationDate.getTime())) {
+        throw new Error("Invalid bot activation time");
+    }
+    botActivationTime = activationDate.toISOString();
+    console.log(`[DEBUG] Bot activation cutoff set: ${botActivationTime}`);
+    return botActivationTime;
+}
+
+function getOrderTimestamp(order) {
+    const rawTimestamp =
+        order?.timestamp ||
+        order?.created_at ||
+        order?.createdAt ||
+        order?.order_timestamp ||
+        null;
+
+    if (!rawTimestamp) return null;
+    const parsed = new Date(rawTimestamp);
+    if (Number.isNaN(parsed.getTime())) return null;
+    return parsed;
+}
+
+function isOrderEligibleForCurrentRun(order, activationTime = botActivationTime) {
+    if (!activationTime) return false;
+
+    const orderTimestamp = getOrderTimestamp(order);
+    if (!orderTimestamp) return false;
+
+    const activationDate = activationTime instanceof Date ? activationTime : new Date(activationTime);
+    if (Number.isNaN(activationDate.getTime())) return false;
+
+    return orderTimestamp.getTime() > activationDate.getTime();
+}
 
 function formatWaJid(waNumber) {
     let num = (waNumber || "").toString().replace(/\D/g, "");
@@ -223,6 +273,7 @@ async function sendViaCurrent(jid, text) {
 
 async function startBot() {
     try {
+        setOrderNotificationsReady(false, "initializing socket");
         const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
         const { version } = await fetchLatestBaileysVersion();
 
@@ -360,6 +411,7 @@ async function startBot() {
                 qrcode.generate(qr, { small: true });
             }
             if (connection === "close") {
+                setOrderNotificationsReady(false, "connection closed");
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const errorMsg = lastDisconnect?.error?.message || 'Unknown error';
                 console.log("\n[-] Koneksi terputus!");
@@ -388,6 +440,8 @@ async function startBot() {
                     });
                 } catch (e) { console.log("[!] Error fetch grup: " + e.message); }
                 console.log("\n[*] Bot siap menerima pesan!\n");
+                setBotActivationTime();
+                setOrderNotificationsReady(true, "connection open");
             }
         });
 
@@ -460,8 +514,21 @@ async function startBot() {
                 .channel("public:orders:insert")
                 .on("postgres_changes", { event: "INSERT", schema: "public", table: "orders" }, async (payload) => {
                     const s = currentSock;
-                    if (!s?.user) return;
+                    if (!isOrderNotificationReady()) {
+                        console.log("[DEBUG] Skipping INSERT notification because bot is not fully active yet");
+                        return;
+                    }
                     const orderPayload = payload.new;
+
+                    // --- DEDUP: Cegah INSERT Realtime terfiring 2x (misal: event "pending" + "insert") ---
+                    const insertNotifKey = orderPayload.id + ":PENDING";
+                    if (notifiedOrderIds.has(insertNotifKey)) {
+                        console.log("[DEBUG] Skipping duplicate INSERT notification for order:", orderPayload.id);
+                        return;
+                    }
+                    // Tandai segera agar event kedua yang mungkin muncul langsung dibuang
+                    notifiedOrderIds.add(insertNotifKey);
+
                     console.log("\n[+] ORDER BARU (INSERT): " + orderPayload.id);
 
                     // Ambil data lengkap order dari database agar data tidak undefined
@@ -472,7 +539,15 @@ async function startBot() {
                         .single();
 
                     if (fetchErr || !order) {
+                        // Kalau fetch gagal, hapus key agar bisa dicoba ulang via polling
+                        notifiedOrderIds.delete(insertNotifKey);
                         console.error("[!] Gagal mengambil detail lengkap order untuk INSERT:", fetchErr?.message);
+                        return;
+                    }
+
+                    if (!isOrderEligibleForCurrentRun(order)) {
+                        notifiedOrderIds.delete(insertNotifKey);
+                        console.log("[DEBUG] Skipping INSERT notification for old order:", order.id);
                         return;
                     }
 
@@ -489,30 +564,11 @@ async function startBot() {
                     try {
                         const groupId = await resolveGroupId(s);
                         await sendViaCurrent(groupId, notif);
-                    } catch (err) { console.error("[!] Error notif INSERT:", err.message); }
-
-                    // Japri pesanan masuk (PENDING) ke nomor user
-                    const waJid = await resolveRealJid(order.wa_number);
-                    if (waJid) {
-                        try {
-                            const paymentMsg = 
-                                "*PESANAN MASUK - MENUNGGU PEMBAYARAN!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "Halo Kak!\n\n" +
-                                "Terima kasih telah melakukan pemesanan di *noxarianet store*!\n\n" +
-                                "ID Pesanan: *" + order.id + "*\n" +
-                                "Produk: *" + order.product + "*\n" +
-                                "Varian: " + (order.variant || "-") + "\n" +
-                                "Total Bayar: *Rp " + Number(order.pg_total || order.price || 0).toLocaleString("id-ID") + "*\n" +
-                                "Metode: *" + (order.payment_method || "-") + "*\n" +
-                                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "Silakan lakukan pembayaran melalui link berikut:\n" +
-                                (order.pg_payment_link ? order.pg_payment_link : "-") + "\n\n" +
-                                "Pesanan Kakak akan diproses otomatis setelah pembayaran sukses terverifikasi. Terima kasih!";
-                            console.log("[DEBUG] Sending PENDING message to user:", waJid);
-                            await sendViaCurrent(waJid, paymentMsg);
-                        } catch (err) {
-                            console.error("[!] Gagal kirim japri pesanan masuk:", err.message);
-                        }
+                        console.log("[DEBUG] INSERT notif sent, key registered:", insertNotifKey);
+                    } catch (err) {
+                        // Kirim gagal → hapus key agar polling bisa fallback
+                        notifiedOrderIds.delete(insertNotifKey);
+                        console.error("[!] Error notif INSERT:", err.message);
                     }
                 })
                 .subscribe((status) => console.log("[*] Realtime [INSERT]: " + status));
@@ -521,8 +577,15 @@ async function startBot() {
                 .channel("public:orders:update")
                 .on("postgres_changes", { event: "UPDATE", schema: "public", table: "orders" }, async (payload) => {
                     const s = currentSock;
-                    if (!s?.user) return;
+                    if (!isOrderNotificationReady()) {
+                        console.log("[DEBUG] Skipping UPDATE notification because bot is not fully active yet");
+                        return;
+                    }
                     const orderPayload = payload.new;
+                    if (!isOrderEligibleForCurrentRun(orderPayload)) {
+                        console.log("[DEBUG] Skipping UPDATE notification for old order:", orderPayload.id);
+                        return;
+                    }
                     const newStatus = orderPayload.status;
                     const notifKey = orderPayload.id + ":" + newStatus;
                     if (notifiedOrderIds.has(notifKey)) return;
@@ -539,6 +602,12 @@ async function startBot() {
                     if (fetchErr || !order) {
                         notifiedOrderIds.delete(notifKey);
                         console.error("[!] Gagal mengambil detail lengkap order untuk UPDATE:", fetchErr?.message);
+                        return;
+                    }
+
+                    if (!isOrderEligibleForCurrentRun(order)) {
+                        notifiedOrderIds.delete(notifKey);
+                        console.log("[DEBUG] Skipping UPDATE notification after fetch for old order:", order.id);
                         return;
                     }
 
@@ -639,18 +708,17 @@ async function startBot() {
         // FIX 4: notifiedOrderIds.delete on error - agar gagal send bisa di-retry
         if (!pollingStarted) {
             pollingStarted = true;
-            const POLL_WINDOW_MS = 60 * 60 * 1000;
 
             setInterval(async () => {
                 if (!supabase || !currentSock) return;
-                if (!currentSock.user) return;
+                if (!isOrderNotificationReady()) return;
+                if (!botActivationTime) return;
 
                 try {
-                    const since = new Date(Date.now() - POLL_WINDOW_MS).toISOString();
                     const { data: orders, error } = await supabase
                         .from("orders").select("*")
                         .in("status", ["PENDING", "PROCESSING", "COMPLETED", "FAILED"])
-                        .gt("timestamp", since)
+                        .gt("timestamp", botActivationTime)
                         .order("timestamp", { ascending: true });
 
                     if (error || !orders || orders.length === 0) return;
@@ -658,35 +726,26 @@ async function startBot() {
                     for (const order of orders) {
                         const notifKey = order.id + ":" + order.status;
                         if (notifiedOrderIds.has(notifKey)) continue;
-                        if (!currentSock?.user) { console.log("[!] [POLLING] Koneksi terputus, berhenti."); break; }
+                        if (!isOrderNotificationReady()) {
+                            console.log("[!] [POLLING] Bot belum aktif penuh, berhenti.");
+                            break;
+                        }
 
                         notifiedOrderIds.add(notifKey);
                         console.log("\n[+] [POLLING] " + order.id + " - " + order.status);
+
+                        if (!isOrderEligibleForCurrentRun(order)) {
+                            notifiedOrderIds.delete(notifKey);
+                            console.log("[DEBUG] [POLLING] Skipping old order:", order.id);
+                            continue;
+                        }
+
                         console.log("[DEBUG] [POLLING] wa_number from order:", order.wa_number);
                         const waJid = await resolveRealJid(order.wa_number);
                         console.log("[DEBUG] [POLLING] Resolved waJid:", waJid);
 
                         try {
                             if (order.status === "PENDING") {
-                                if (waJid) {
-                                    console.log("[DEBUG] [POLLING] Sending PENDING message to user...");
-                                    const paymentMsg = 
-                                        "*PESANAN MASUK - MENUNGGU PEMBAYARAN!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Halo Kak!\n\n" +
-                                        "Terima kasih telah melakukan pemesanan di *noxarianet store*!\n\n" +
-                                        "ID Pesanan: *" + order.id + "*\n" +
-                                        "Produk: *" + order.product + "*\n" +
-                                        "Varian: " + (order.variant || "-") + "\n" +
-                                        "Total Bayar: *Rp " + Number(order.pg_total || order.price || 0).toLocaleString("id-ID") + "*\n" +
-                                        "Metode: *" + (order.payment_method || "-") + "*\n" +
-                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Silakan lakukan pembayaran melalui link berikut:\n" +
-                                        (order.pg_payment_link ? order.pg_payment_link : "-") + "\n\n" +
-                                        "Pesanan Kakak akan diproses otomatis setelah pembayaran sukses terverifikasi. Terima kasih!";
-                                    await sendViaCurrent(waJid, paymentMsg);
-                                } else {
-                                    console.log("[DEBUG] [POLLING] waJid is null, skipping PENDING message");
-                                }
                                 try {
                                     const gid = await resolveGroupId(currentSock);
                                     console.log("[DEBUG] [POLLING] Sending PENDING message to group:", gid);
@@ -701,7 +760,10 @@ async function startBot() {
                                         new Date(order.timestamp || Date.now()).toLocaleString("id-ID") + "\n" +
                                         "_Menunggu pembayaran..._";
                                     await sendViaCurrent(gid, notif);
-                                } catch (e) { console.error("[!] Error notif grup PENDING polling:", e.message); }
+                                } catch (e) {
+                                    console.error("[!] Error notif grup PENDING polling:", e.message);
+                                    throw e;
+                                }
                             } else if (order.status === "PROCESSING") {
                                 if (waJid) {
                                     console.log("[DEBUG] [POLLING] Sending PROCESSING message to user...");
@@ -789,5 +851,15 @@ async function startBot() {
     }
 }
 
-console.log("\n=== NOXARIANET BOT v5.0 (AUTO PAYMENT) ===\n");
-startBot();
+if (require.main === module) {
+    console.log("\n=== NOXARIANET BOT v5.0 (AUTO PAYMENT) ===\n");
+    startBot();
+}
+
+module.exports = {
+    __test: {
+        setBotActivationTime,
+        getOrderTimestamp,
+        isOrderEligibleForCurrentRun,
+    },
+};
