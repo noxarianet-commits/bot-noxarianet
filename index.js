@@ -286,7 +286,7 @@ async function startBot() {
                 "*.panel*    -- Status Server\n\n" +
                 "--------------------\n" +
                 "_Ketik perintah di atas untuk memulai_\n" +
-                "*© 2026 noxarianet.web.id*";
+                "*© 2026 www.noxarianet.web.id*";
             try {
                 await sock.sendMessage(jid, { text: menuTeks }, getSendOptions(quotedMsg));
             } catch (err) { console.error("[!] Gagal kirim menu:", err.message); }
