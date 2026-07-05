@@ -126,12 +126,35 @@ function isOrderEligibleForCurrentRun(order, activationTime = botActivationTime)
     return orderTimestamp.getTime() > activationDate.getTime();
 }
 
+function isOrderEligibleForUpdate(order) {
+    const orderTimestamp = getOrderTimestamp(order);
+    if (!orderTimestamp) return false;
+
+    // Izinkan order yang dibuat dalam 24 jam terakhir untuk update realtime
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    return orderTimestamp.getTime() > oneDayAgo;
+}
+
 function formatWaJid(waNumber) {
     let num = (waNumber || "").toString().replace(/\D/g, "");
     if (!num) return null;
-    if (num.startsWith("0")) num = "62" + num.slice(1);
-    else if (num.startsWith("620")) num = "62" + num.slice(3);
-    else if (!num.startsWith("62")) num = "62" + num;
+
+    // Bersihkan potensi double country code prefix (misal: 62628... -> 628...)
+    if (num.startsWith("6262")) {
+        num = num.slice(2);
+    }
+
+    if (num.startsWith("0")) {
+        num = "62" + num.slice(1);
+    } else if (num.startsWith("620")) {
+        num = "62" + num.slice(3);
+    } else if (!num.startsWith("62")) {
+        num = "62" + num;
+    }
+
+    // Validasi panjang nomor telepon minimal (9 digit) untuk menghindari JID sampah
+    if (num.length < 9) return null;
+
     return num + "@s.whatsapp.net";
 }
 
@@ -139,14 +162,20 @@ async function resolveRealJid(waNumber) {
     const basicJid = formatWaJid(waNumber);
     if (!basicJid || !currentSock?.user) return basicJid;
     try {
-        const [result] = await currentSock.onWhatsApp(basicJid);
+        // Implementasi timeout 3 detik untuk mencegah bot menggantung jika WA server lambat
+        const resolvePromise = currentSock.onWhatsApp(basicJid);
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("onWhatsApp timeout")), 3000)
+        );
+
+        const [result] = await Promise.race([resolvePromise, timeoutPromise]);
         if (result?.exists && result?.jid) {
             console.log(`[DEBUG] onWhatsApp resolved: ${waNumber} -> ${result.jid}`);
             return result.jid;
         }
-        console.log(`[DEBUG] onWhatsApp: ${waNumber} not found on WhatsApp, using basic JID`);
+        console.log(`[DEBUG] onWhatsApp: ${waNumber} tidak ditemukan di WA, menggunakan JID dasar: ${basicJid}`);
     } catch (e) {
-        console.error(`[DEBUG] onWhatsApp error for ${waNumber}:`, e.message);
+        console.error(`[DEBUG] onWhatsApp error/timeout untuk ${waNumber}:`, e.message);
     }
     return basicJid;
 }
@@ -184,7 +213,7 @@ function formatLicenses(licenses) {
 function parseTargetNote(noteVal) {
     if (!noteVal) return "-";
     if (typeof noteVal !== "string") return String(noteVal);
-    
+
     const trimmed = noteVal.trim();
     if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
         try {
@@ -200,10 +229,10 @@ function parseTargetNote(noteVal) {
 function formatFulfillmentDetails(order) {
     const details = order.account_details || {};
     const rawItems = details.raw_items || [];
-    
+
     const h2hItems = rawItems.filter(item => item.order_process === "h2h");
     const smmItems = rawItems.filter(item => item.order_process === "smm");
-    
+
     if (h2hItems.length > 0) {
         return h2hItems.map((item, i) => {
             let snList = "-";
@@ -218,16 +247,16 @@ function formatFulfillmentDetails(order) {
             }
             const target = parseTargetNote(item.note || item.target);
             return `*Item ${i + 1}:* ${item.product_name} - ${item.variant_name}\n` +
-                   `   - Target: *${target}*\n` +
-                   `   - SN/Ref: *${snList}*\n` +
-                   `   - Status: *Sukses*`;
+                `   - Target: *${target}*\n` +
+                `   - SN/Ref: *${snList}*\n` +
+                `   - Status: *Sukses*`;
         }).join("\n\n");
     } else if (smmItems.length > 0) {
         return smmItems.map((item, i) => {
             const target = parseTargetNote(item.note || item.target);
             return `*Item ${i + 1}:* ${item.product_name} - ${item.variant_name}\n` +
-                   `   - Target: *${target}*\n` +
-                   `   - Status: *Sukses*`;
+                `   - Target: *${target}*\n` +
+                `   - Status: *Sukses*`;
         }).join("\n\n");
     } else {
         const licenses = details.licenses || [];
@@ -235,16 +264,16 @@ function formatFulfillmentDetails(order) {
             return formatLicenses(licenses);
         }
     }
-    
+
     if (rawItems.length > 0) {
         return rawItems.map((item, i) => {
             const target = parseTargetNote(item.note || item.target);
             return `*Item ${i + 1}:* ${item.variant_name || item.product_name || "Produk Digital"}\n` +
-                   `   - Detail: *${target}*\n` +
-                   `   - Status: *Sukses*`;
+                `   - Detail: *${target}*\n` +
+                `   - Status: *Sukses*`;
         }).join("\n\n");
     }
-    
+
     return "_Detail akun tidak tersedia. Hubungi admin._";
 }
 
@@ -260,15 +289,28 @@ async function resolveGroupId(sock) {
     return targetGroupId;
 }
 
-async function sendViaCurrent(jid, text) {
+async function sendViaCurrent(jid, text, retries = 3, delay = 1500) {
     console.log(`[DEBUG] Attempting to send message to: ${jid}`);
     if (!currentSock?.user) {
         const errMsg = "Connection not ready";
         console.error(`[DEBUG] ${errMsg}`);
         throw new Error(errMsg);
     }
-    await currentSock.sendMessage(jid, { text });
-    console.log(`[DEBUG] SUCCESS: Message sent to ${jid}`);
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            await currentSock.sendMessage(jid, { text });
+            console.log(`[DEBUG] SUCCESS: Message sent to ${jid} on attempt ${attempt}/${retries}`);
+            return; // Berhasil, keluar dari fungsi
+        } catch (err) {
+            console.error(`[!] Attempt ${attempt}/${retries} failed to send message to ${jid}: ${err.message}`);
+            if (attempt === retries) {
+                throw err; // Lempar eror jika percobaan terakhir gagal
+            }
+            console.log(`[DEBUG] Retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
 }
 
 async function startBot() {
@@ -417,14 +459,14 @@ async function startBot() {
                 console.log("\n[-] Koneksi terputus!");
                 console.log("    Status Code:", statusCode);
                 console.log("    Error:", errorMsg);
-                
+
                 if (statusCode === DisconnectReason.loggedOut) {
                     console.log("    [!] Terdeteksi logout, menghapus semua file auth!");
                     cleanSessionFiles(true); // Clean everything including creds.json
                     console.log("    [!] Silakan restart bot dan scan QR ulang.");
                     return; // Jangan reconnect jika logout
                 }
-                
+
                 console.log("    [*] Reconnecting in 3 seconds...");
                 setTimeout(() => startBot(), 3000);
             } else if (connection === "open") {
@@ -549,18 +591,13 @@ async function startBot() {
                         console.log("[DEBUG] Skipping UPDATE notification because bot is not fully active yet");
                         return;
                     }
+
                     const orderPayload = payload.new;
-                    if (!isOrderEligibleForCurrentRun(orderPayload)) {
-                        console.log("[DEBUG] Skipping UPDATE notification for old order:", orderPayload.id);
-                        return;
-                    }
                     const newStatus = orderPayload.status;
                     const notifKey = orderPayload.id + ":" + newStatus;
                     if (notifiedOrderIds.has(notifKey)) return;
-                    notifiedOrderIds.add(notifKey);
-                    console.log("\n[~] ORDER UPDATE [Realtime]: " + orderPayload.id + " -> " + newStatus);
 
-                    // Ambil data lengkap order dari database agar data tidak undefined
+                    // Ambil data lengkap order dari database agar data tidak undefined dan memiliki timestamp
                     const { data: order, error: fetchErr } = await supabase
                         .from("orders")
                         .select("*")
@@ -568,34 +605,42 @@ async function startBot() {
                         .single();
 
                     if (fetchErr || !order) {
-                        notifiedOrderIds.delete(notifKey);
                         console.error("[!] Gagal mengambil detail lengkap order untuk UPDATE:", fetchErr?.message);
                         return;
                     }
 
-                    if (!isOrderEligibleForCurrentRun(order)) {
-                        notifiedOrderIds.delete(notifKey);
-                        console.log("[DEBUG] Skipping UPDATE notification after fetch for old order:", order.id);
+                    if (!isOrderEligibleForUpdate(order)) {
+                        console.log("[DEBUG] Skipping UPDATE notification for very old order (created > 24h ago):", order.id);
                         return;
                     }
+
+                    notifiedOrderIds.add(notifKey);
+                    console.log("\n[~] ORDER UPDATE [Realtime]: " + order.id + " -> " + newStatus);
 
                     console.log("[DEBUG] wa_number from order:", order.wa_number);
                     const waJid = await resolveRealJid(order.wa_number);
                     console.log("[DEBUG] Resolved waJid:", waJid);
                     try {
+                        let dmFailed = null;
                         if (newStatus === "PROCESSING") {
                             if (waJid) {
-                                console.log("[DEBUG] Sending PROCESSING message to user...");
-                                await sendViaCurrent(waJid,
-                                    "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
-                                    "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
-                                    "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
-                                    "Kami akan langsung kirim detail akun ke sini ya Kak!"
-                                );
+                                try {
+                                    console.log("[DEBUG] Sending PROCESSING message to user...");
+                                    await sendViaCurrent(waJid,
+                                        "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
+                                        "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
+                                        "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
+                                        "Kami akan langsung kirim detail akun ke sini ya Kak!"
+                                    );
+                                } catch (e) {
+                                    console.error(`[!] Gagal DM PROCESSING ke user:`, e.message);
+                                    dmFailed = e;
+                                }
                             } else {
                                 console.log("[DEBUG] waJid is null, skipping PROCESSING message to user");
                             }
+                            if (dmFailed) throw dmFailed;
                             return;
                         }
                         if (newStatus === "COMPLETED") {
@@ -604,32 +649,40 @@ async function startBot() {
                             const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
                             const fulfillmentText = formatFulfillmentDetails(order);
                             const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
-                            const footerMsg = isH2H 
+                            const footerMsg = isH2H
                                 ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                  "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
-                                  "Tinggalkan ulasan positif ya Kak!"
+                                "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                "Tinggalkan ulasan positif ya Kak!"
                                 : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                  "_Jangan share akun ini ke orang lain!_\n" +
-                                  "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
-                                  "Tinggalkan ulasan positif ya Kak!";
+                                "_Jangan share akun ini ke orang lain!_\n" +
+                                "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                "Tinggalkan ulasan positif ya Kak!";
 
                             if (waJid) {
-                                console.log("[DEBUG] Sending COMPLETED message to user...");
-                                await sendViaCurrent(waJid,
-                                    "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                                    "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    labelDetail + "\n\n" + fulfillmentText + "\n\n" +
-                                    footerMsg
-                                );
+                                try {
+                                    console.log("[DEBUG] Sending COMPLETED message to user...");
+                                    await sendViaCurrent(waJid,
+                                        "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
+                                        "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        labelDetail + "\n\n" + fulfillmentText + "\n\n" +
+                                        footerMsg
+                                    );
+                                } catch (e) {
+                                    console.error(`[!] Gagal DM COMPLETED ke user:`, e.message);
+                                    dmFailed = e;
+                                }
                             } else {
                                 console.log("[DEBUG] waJid is null, skipping COMPLETED message to user");
                             }
+
                             try {
                                 const gid = await resolveGroupId(s);
                                 console.log("[DEBUG] Sending COMPLETED message to group:", gid);
                                 await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number));
                             } catch (e) { console.error("[!] Error notif grup COMPLETED:", e.message); }
+
+                            if (dmFailed) throw dmFailed;
                             return;
                         }
                         if (newStatus === "FAILED") {
@@ -642,24 +695,32 @@ async function startBot() {
                                     "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*"
                                 );
                             } catch (e) { console.error("[!] Error notif grup FAILED:", e.message); }
+
                             if (waJid) {
-                                console.log("[DEBUG] Sending FAILED message to user...");
-                                let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
-                                    "Tim kami segera menangani masalah ini.\n" +
-                                    "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                    "Mohon maaf atas ketidaknyamanannya";
-                                if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
-                                    failedText = "*MAAF, PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Halo Kak, pesanan Anda dengan ID *" + order.id + "* gagal karena *nomor tujuan salah atau tidak valid*.\n\n" +
-                                        "Saldo telah dikembalikan (refund) ke sistem kami. Silakan hubungi admin di WhatsApp untuk mengoreksi nomor tujuan agar pesanan bisa diproses ulang, atau untuk mengajukan pengembalian dana.\n\n" +
+                                try {
+                                    console.log("[DEBUG] Sending FAILED message to user...");
+                                    let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
+                                        "Tim kami segera menangani masalah ini.\n" +
                                         "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                        "Mohon maaf atas ketidaknyamanannya.";
+                                        "Mohon maaf atas ketidaknyamanannya";
+                                    if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
+                                        failedText = "*MAAF, PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                            "Halo Kak, pesanan Anda dengan ID *" + order.id + "* gagal karena *nomor tujuan salah atau tidak valid*.\n\n" +
+                                            "Saldo telah dikembalikan (refund) ke sistem kami. Silakan hubungi admin di WhatsApp untuk mengoreksi nomor tujuan agar pesanan bisa diproses ulang, atau untuk mengajukan pengembalian dana.\n\n" +
+                                            "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
+                                            "Mohon maaf atas ketidaknyamanannya.";
+                                    }
+                                    await sendViaCurrent(waJid, failedText);
+                                } catch (e) {
+                                    console.error(`[!] Gagal DM FAILED ke user:`, e.message);
+                                    dmFailed = e;
                                 }
-                                await sendViaCurrent(waJid, failedText);
                             } else {
                                 console.log("[DEBUG] waJid is null, skipping FAILED message to user");
                             }
+
+                            if (dmFailed) throw dmFailed;
                         }
                     } catch (err) {
                         notifiedOrderIds.delete(notifKey);
@@ -729,41 +790,54 @@ async function startBot() {
                                         "_Menunggu pembayaran..._";
                                     await sendViaCurrent(gid, notif);
                                 } catch (e) { console.error("[!] Error notif grup PENDING polling:", e.message); }
-                            } else if (order.status === "PROCESSING") {
+                            }
+                            let dmFailed = null;
+                            if (order.status === "PROCESSING") {
                                 if (waJid) {
-                                    console.log("[DEBUG] [POLLING] Sending PROCESSING message to user...");
-                                    await sendViaCurrent(waJid,
-                                        "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
-                                        "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
-                                        "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
-                                        "Kami akan langsung kirim detail akun ke sini ya Kak!"
-                                    );
+                                    try {
+                                        console.log("[DEBUG] [POLLING] Sending PROCESSING message to user...");
+                                        await sendViaCurrent(waJid,
+                                            "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                            "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
+                                            "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
+                                            "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
+                                            "Kami akan langsung kirim detail akun ke sini ya Kak!"
+                                        );
+                                    } catch (e) {
+                                        console.error(`[!] [POLLING] Gagal DM PROCESSING ke user:`, e.message);
+                                        dmFailed = e;
+                                    }
                                 } else {
                                     console.log("[DEBUG] [POLLING] waJid is null, skipping PROCESSING message");
                                 }
+                                if (dmFailed) throw dmFailed;
                             } else if (order.status === "COMPLETED") {
                                 const details = order.account_details || {};
                                 const rawItems = details.raw_items || [];
                                 const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
                                 const fulfillmentText = formatFulfillmentDetails(order);
                                 const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
-                                const footerMsg = isH2H 
+                                const footerMsg = isH2H
                                     ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                      "Terima kasih sudah berbelanja di *noxarianet store*!"
+                                    "Terima kasih sudah berbelanja di *noxarianet store*!"
                                     : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                      "_Jangan share akun ini ke orang lain!_\n" +
-                                      "Terima kasih sudah berbelanja di *noxarianet store*!";
+                                    "_Jangan share akun ini ke orang lain!_\n" +
+                                    "Terima kasih sudah berbelanja di *noxarianet store*!";
 
                                 if (waJid) {
-                                    console.log("[DEBUG] [POLLING] Sending COMPLETED message to user...");
-                                    await sendViaCurrent(waJid,
-                                        "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                                        "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        labelDetail + "\n\n" + fulfillmentText + "\n\n" +
-                                        footerMsg
-                                    );
+                                    try {
+                                        console.log("[DEBUG] [POLLING] Sending COMPLETED message to user...");
+                                        await sendViaCurrent(waJid,
+                                            "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                            "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
+                                            "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                            labelDetail + "\n\n" + fulfillmentText + "\n\n" +
+                                            footerMsg
+                                        );
+                                    } catch (e) {
+                                        console.error(`[!] [POLLING] Gagal DM COMPLETED ke user:`, e.message);
+                                        dmFailed = e;
+                                    }
                                 } else {
                                     console.log("[DEBUG] [POLLING] waJid is null, skipping COMPLETED message");
                                 }
@@ -772,6 +846,7 @@ async function startBot() {
                                     console.log("[DEBUG] [POLLING] Sending COMPLETED message to group:", gid);
                                     await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number));
                                 } catch (e) { console.error("[!] Error notif grup COMPLETED polling:", e.message); }
+                                if (dmFailed) throw dmFailed;
                             } else if (order.status === "FAILED") {
                                 try {
                                     const gid = await resolveGroupId(currentSock);
@@ -783,30 +858,38 @@ async function startBot() {
                                     );
                                 } catch (e) { console.error("[!] Error notif grup FAILED polling:", e.message); }
                                 if (waJid) {
-                                    console.log("[DEBUG] [POLLING] Sending FAILED message to user...");
-                                    let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
-                                        "Tim kami segera menangani masalah ini.\n" +
-                                        "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                        "Mohon maaf atas ketidaknyamanannya";
-                                    if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
-                                        failedText = "*MAAF, PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                            "Halo Kak, pesanan Anda dengan ID *" + order.id + "* gagal karena *nomor tujuan salah atau tidak valid*.\n\n" +
-                                            "Saldo telah dikembalikan (refund) ke sistem kami. Silakan hubungi admin di WhatsApp untuk mengoreksi nomor tujuan agar pesanan bisa diproses ulang, atau untuk mengajukan pengembalian dana.\n\n" +
+                                    try {
+                                        console.log("[DEBUG] [POLLING] Sending FAILED message to user...");
+                                        let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                            "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
+                                            "Tim kami segera menangani masalah ini.\n" +
                                             "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                            "Mohon maaf atas ketidaknyamanannya.";
+                                            "Mohon maaf atas ketidaknyamanannya";
+                                        if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
+                                            failedText = "*MAAF, PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                                "Halo Kak, pesanan Anda dengan ID *" + order.id + "* gagal karena *nomor tujuan salah atau tidak valid*.\n\n" +
+                                                "Saldo telah dikembalikan (refund) ke sistem kami. Silakan hubungi admin di WhatsApp untuk mengoreksi nomor tujuan agar pesanan bisa diproses ulang, atau untuk mengajukan pengembalian dana.\n\n" +
+                                                "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
+                                                "Mohon maaf atas ketidaknyamanannya.";
+                                        }
+                                        await sendViaCurrent(waJid, failedText);
+                                    } catch (e) {
+                                        console.error(`[!] [POLLING] Gagal DM FAILED ke user:`, e.message);
+                                        dmFailed = e;
                                     }
-                                    await sendViaCurrent(waJid, failedText);
                                 } else {
                                     console.log("[DEBUG] [POLLING] waJid is null, skipping FAILED message to user");
                                 }
+                                if (dmFailed) throw dmFailed;
                             }
                         } catch (sendErr) {
                             notifiedOrderIds.delete(notifKey);
                             console.error("[!] [POLLING] Gagal kirim notif " + order.id + ", akan retry:", sendErr.message);
                         }
                     }
-                } catch (err) { /* silent */ }
+                } catch (err) {
+                    console.error("[!] [POLLING] Error in polling loop:", err.message);
+                }
             }, 10000);
         }
 
