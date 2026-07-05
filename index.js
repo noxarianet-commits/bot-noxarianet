@@ -80,6 +80,7 @@ function formatWaJid(waNumber) {
     let num = (waNumber || "").toString().replace(/\D/g, "");
     if (!num) return null;
     if (num.startsWith("0")) num = "62" + num.slice(1);
+    else if (num.startsWith("620")) num = "62" + num.slice(3);
     else if (!num.startsWith("62")) num = "62" + num;
     return num + "@s.whatsapp.net";
 }
@@ -88,13 +89,12 @@ async function resolveRealJid(waNumber) {
     const basicJid = formatWaJid(waNumber);
     if (!basicJid || !currentSock?.user) return basicJid;
     try {
-        const num = basicJid.split("@")[0];
-        const [result] = await currentSock.onWhatsApp(num);
+        const [result] = await currentSock.onWhatsApp(basicJid);
         if (result?.exists && result?.jid) {
-            console.log(`[DEBUG] onWhatsApp resolved: ${num} -> ${result.jid}`);
+            console.log(`[DEBUG] onWhatsApp resolved: ${waNumber} -> ${result.jid}`);
             return result.jid;
         }
-        console.log(`[DEBUG] onWhatsApp: ${num} not found on WhatsApp, using basic JID`);
+        console.log(`[DEBUG] onWhatsApp: ${waNumber} not found on WhatsApp, using basic JID`);
     } catch (e) {
         console.error(`[DEBUG] onWhatsApp error for ${waNumber}:`, e.message);
     }
@@ -461,8 +461,21 @@ async function startBot() {
                 .on("postgres_changes", { event: "INSERT", schema: "public", table: "orders" }, async (payload) => {
                     const s = currentSock;
                     if (!s?.user) return;
-                    const order = payload.new;
-                    console.log("\n[+] ORDER BARU (INSERT): " + order.id);
+                    const orderPayload = payload.new;
+                    console.log("\n[+] ORDER BARU (INSERT): " + orderPayload.id);
+
+                    // Ambil data lengkap order dari database agar data tidak undefined
+                    const { data: order, error: fetchErr } = await supabase
+                        .from("orders")
+                        .select("*")
+                        .eq("id", orderPayload.id)
+                        .single();
+
+                    if (fetchErr || !order) {
+                        console.error("[!] Gagal mengambil detail lengkap order untuk INSERT:", fetchErr?.message);
+                        return;
+                    }
+
                     const notif =
                         "*ORDER BARU MASUK!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                         "ID: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
@@ -477,6 +490,30 @@ async function startBot() {
                         const groupId = await resolveGroupId(s);
                         await sendViaCurrent(groupId, notif);
                     } catch (err) { console.error("[!] Error notif INSERT:", err.message); }
+
+                    // Japri pesanan masuk (PENDING) ke nomor user
+                    const waJid = await resolveRealJid(order.wa_number);
+                    if (waJid) {
+                        try {
+                            const paymentMsg = 
+                                "*PESANAN MASUK - MENUNGGU PEMBAYARAN!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                "Halo Kak!\n\n" +
+                                "Terima kasih telah melakukan pemesanan di *noxarianet store*!\n\n" +
+                                "ID Pesanan: *" + order.id + "*\n" +
+                                "Produk: *" + order.product + "*\n" +
+                                "Varian: " + (order.variant || "-") + "\n" +
+                                "Total Bayar: *Rp " + Number(order.pg_total || order.price || 0).toLocaleString("id-ID") + "*\n" +
+                                "Metode: *" + (order.payment_method || "-") + "*\n" +
+                                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                "Silakan lakukan pembayaran melalui link berikut:\n" +
+                                (order.pg_payment_link ? order.pg_payment_link : "-") + "\n\n" +
+                                "Pesanan Kakak akan diproses otomatis setelah pembayaran sukses terverifikasi. Terima kasih!";
+                            console.log("[DEBUG] Sending PENDING message to user:", waJid);
+                            await sendViaCurrent(waJid, paymentMsg);
+                        } catch (err) {
+                            console.error("[!] Gagal kirim japri pesanan masuk:", err.message);
+                        }
+                    }
                 })
                 .subscribe((status) => console.log("[*] Realtime [INSERT]: " + status));
 
@@ -485,12 +522,26 @@ async function startBot() {
                 .on("postgres_changes", { event: "UPDATE", schema: "public", table: "orders" }, async (payload) => {
                     const s = currentSock;
                     if (!s?.user) return;
-                    const order = payload.new;
-                    const newStatus = order.status;
-                    const notifKey = order.id + ":" + newStatus;
+                    const orderPayload = payload.new;
+                    const newStatus = orderPayload.status;
+                    const notifKey = orderPayload.id + ":" + newStatus;
                     if (notifiedOrderIds.has(notifKey)) return;
                     notifiedOrderIds.add(notifKey);
-                    console.log("\n[~] ORDER UPDATE [Realtime]: " + order.id + " -> " + newStatus);
+                    console.log("\n[~] ORDER UPDATE [Realtime]: " + orderPayload.id + " -> " + newStatus);
+
+                    // Ambil data lengkap order dari database agar data tidak undefined
+                    const { data: order, error: fetchErr } = await supabase
+                        .from("orders")
+                        .select("*")
+                        .eq("id", orderPayload.id)
+                        .single();
+
+                    if (fetchErr || !order) {
+                        notifiedOrderIds.delete(notifKey);
+                        console.error("[!] Gagal mengambil detail lengkap order untuk UPDATE:", fetchErr?.message);
+                        return;
+                    }
+
                     console.log("[DEBUG] wa_number from order:", order.wa_number);
                     const waJid = await resolveRealJid(order.wa_number);
                     console.log("[DEBUG] Resolved waJid:", waJid);
@@ -598,7 +649,7 @@ async function startBot() {
                     const since = new Date(Date.now() - POLL_WINDOW_MS).toISOString();
                     const { data: orders, error } = await supabase
                         .from("orders").select("*")
-                        .in("status", ["PROCESSING", "COMPLETED", "FAILED"])
+                        .in("status", ["PENDING", "PROCESSING", "COMPLETED", "FAILED"])
                         .gt("timestamp", since)
                         .order("timestamp", { ascending: true });
 
@@ -616,7 +667,42 @@ async function startBot() {
                         console.log("[DEBUG] [POLLING] Resolved waJid:", waJid);
 
                         try {
-                            if (order.status === "PROCESSING") {
+                            if (order.status === "PENDING") {
+                                if (waJid) {
+                                    console.log("[DEBUG] [POLLING] Sending PENDING message to user...");
+                                    const paymentMsg = 
+                                        "*PESANAN MASUK - MENUNGGU PEMBAYARAN!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Halo Kak!\n\n" +
+                                        "Terima kasih telah melakukan pemesanan di *noxarianet store*!\n\n" +
+                                        "ID Pesanan: *" + order.id + "*\n" +
+                                        "Produk: *" + order.product + "*\n" +
+                                        "Varian: " + (order.variant || "-") + "\n" +
+                                        "Total Bayar: *Rp " + Number(order.pg_total || order.price || 0).toLocaleString("id-ID") + "*\n" +
+                                        "Metode: *" + (order.payment_method || "-") + "*\n" +
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Silakan lakukan pembayaran melalui link berikut:\n" +
+                                        (order.pg_payment_link ? order.pg_payment_link : "-") + "\n\n" +
+                                        "Pesanan Kakak akan diproses otomatis setelah pembayaran sukses terverifikasi. Terima kasih!";
+                                    await sendViaCurrent(waJid, paymentMsg);
+                                } else {
+                                    console.log("[DEBUG] [POLLING] waJid is null, skipping PENDING message");
+                                }
+                                try {
+                                    const gid = await resolveGroupId(currentSock);
+                                    console.log("[DEBUG] [POLLING] Sending PENDING message to group:", gid);
+                                    const notif =
+                                        "*ORDER BARU MASUK!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "ID: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
+                                        "Varian: " + (order.variant || "-") + "\n" +
+                                        "Harga: *Rp " + Number(order.price || 0).toLocaleString("id-ID") + "*\n" +
+                                        "Metode: " + (order.payment_method || "-") + "\n" +
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "WA: *" + maskPhone(order.wa_number) + "*\nEmail: " + (order.email ? maskEmail(order.email) : "-") + "\n" +
+                                        new Date(order.timestamp || Date.now()).toLocaleString("id-ID") + "\n" +
+                                        "_Menunggu pembayaran..._";
+                                    await sendViaCurrent(gid, notif);
+                                } catch (e) { console.error("[!] Error notif grup PENDING polling:", e.message); }
+                            } else if (order.status === "PROCESSING") {
                                 if (waJid) {
                                     console.log("[DEBUG] [POLLING] Sending PROCESSING message to user...");
                                     await sendViaCurrent(waJid,
