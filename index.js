@@ -66,7 +66,8 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
     console.warn("[!] SUPABASE belum dikonfigurasi di .env");
 }
 
-const GROUP_NAME_KEYWORD = "noxarianet";
+const GROUP_INVITE_CODE = "ElNDQJUVYXA64OL51tVnlD";
+const TARGET_GROUP_NAME = "BUKTI TRANSAKSI | noxarianet store";
 const ADMIN_NUMBER = "6285936603517";
 
 let supabaseSubscribed = false;
@@ -75,7 +76,7 @@ let currentSock = null;
 let cachedGroupId = null;
 let orderNotificationsReady = false;
 let botActivationTime = null;
-const targetGroupId = "120363424077781671@g.us";
+const targetGroupId = "120363045610817345@g.us";
 const notifiedOrderIds = new Set();
 
 function setOrderNotificationsReady(isReady, reason = "") {
@@ -126,12 +127,35 @@ function isOrderEligibleForCurrentRun(order, activationTime = botActivationTime)
     return orderTimestamp.getTime() > activationDate.getTime();
 }
 
+function isOrderEligibleForUpdate(order) {
+    const orderTimestamp = getOrderTimestamp(order);
+    if (!orderTimestamp) return false;
+
+    // Izinkan order yang dibuat dalam 24 jam terakhir untuk update realtime
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    return orderTimestamp.getTime() > oneDayAgo;
+}
+
 function formatWaJid(waNumber) {
     let num = (waNumber || "").toString().replace(/\D/g, "");
     if (!num) return null;
-    if (num.startsWith("0")) num = "62" + num.slice(1);
-    else if (num.startsWith("620")) num = "62" + num.slice(3);
-    else if (!num.startsWith("62")) num = "62" + num;
+
+    // Bersihkan potensi double country code prefix (misal: 62628... -> 628...)
+    if (num.startsWith("6262")) {
+        num = num.slice(2);
+    }
+
+    if (num.startsWith("0")) {
+        num = "62" + num.slice(1);
+    } else if (num.startsWith("620")) {
+        num = "62" + num.slice(3);
+    } else if (!num.startsWith("62")) {
+        num = "62" + num;
+    }
+
+    // Validasi panjang nomor telepon minimal (9 digit) untuk menghindari JID sampah
+    if (num.length < 9) return null;
+
     return num + "@s.whatsapp.net";
 }
 
@@ -139,14 +163,20 @@ async function resolveRealJid(waNumber) {
     const basicJid = formatWaJid(waNumber);
     if (!basicJid || !currentSock?.user) return basicJid;
     try {
-        const [result] = await currentSock.onWhatsApp(basicJid);
+        // Implementasi timeout 3 detik untuk mencegah bot menggantung jika WA server lambat
+        const resolvePromise = currentSock.onWhatsApp(basicJid);
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("onWhatsApp timeout")), 3000)
+        );
+
+        const [result] = await Promise.race([resolvePromise, timeoutPromise]);
         if (result?.exists && result?.jid) {
             console.log(`[DEBUG] onWhatsApp resolved: ${waNumber} -> ${result.jid}`);
             return result.jid;
         }
-        console.log(`[DEBUG] onWhatsApp: ${waNumber} not found on WhatsApp, using basic JID`);
+        console.log(`[DEBUG] onWhatsApp: ${waNumber} tidak ditemukan di WA, menggunakan JID dasar: ${basicJid}`);
     } catch (e) {
-        console.error(`[DEBUG] onWhatsApp error for ${waNumber}:`, e.message);
+        console.error(`[DEBUG] onWhatsApp error/timeout untuk ${waNumber}:`, e.message);
     }
     return basicJid;
 }
@@ -248,27 +278,66 @@ function formatFulfillmentDetails(order) {
     return "_Detail akun tidak tersedia. Hubungi admin._";
 }
 
-async function resolveGroupId(sock) {
-    if (cachedGroupId) return cachedGroupId;
+async function syncTargetGroup(sock) {
+    if (!sock?.user) return;
+    try {
+        console.log(`[DEBUG] Mengambil JID grup dari invite code: ${GROUP_INVITE_CODE}`);
+        const info = await sock.groupGetInviteInfo(GROUP_INVITE_CODE);
+        if (info && info.id) {
+            cachedGroupId = info.id;
+            console.log(`[+] Sukses resolve JID grup target dari invite link: ${cachedGroupId} (${info.subject})`);
+            return;
+        }
+    } catch (e) {
+        console.warn(`[!] Gagal resolve JID dari invite link: ${e.message}`);
+    }
+
+    // Fallback: Cocokkan nama persis dari daftar partisipasi
     try {
         const groups = await sock.groupFetchAllParticipating();
-        const tg = Object.values(groups).find((g) =>
-            g.subject.toLowerCase().includes(GROUP_NAME_KEYWORD)
+        const matched = Object.values(groups).find(g => 
+            g.subject.trim() === TARGET_GROUP_NAME ||
+            g.subject.toLowerCase().trim() === TARGET_GROUP_NAME.toLowerCase()
         );
-        if (tg) { cachedGroupId = tg.id; return cachedGroupId; }
-    } catch (e) { console.error("[!] resolveGroupId error:", e.message); }
+        if (matched) {
+            cachedGroupId = matched.id;
+            console.log(`[+] Sukses mencocokkan grup target berdasarkan nama persis: ${cachedGroupId}`);
+            return;
+        }
+    } catch (e) {
+        console.error(`[!] Gagal mencari grup dari list partisipan:`, e.message);
+    }
+}
+
+async function resolveGroupId(sock) {
+    if (cachedGroupId) return cachedGroupId;
+    await syncTargetGroup(sock);
+    if (cachedGroupId) return cachedGroupId;
     return targetGroupId;
 }
 
-async function sendViaCurrent(jid, text) {
+async function sendViaCurrent(jid, text, retries = 3, delay = 1500) {
     console.log(`[DEBUG] Attempting to send message to: ${jid}`);
     if (!currentSock?.user) {
         const errMsg = "Connection not ready";
         console.error(`[DEBUG] ${errMsg}`);
         throw new Error(errMsg);
     }
-    await currentSock.sendMessage(jid, { text });
-    console.log(`[DEBUG] SUCCESS: Message sent to ${jid}`);
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            await currentSock.sendMessage(jid, { text });
+            console.log(`[DEBUG] SUCCESS: Message sent to ${jid} on attempt ${attempt}/${retries}`);
+            return; // Berhasil, keluar dari fungsi
+        } catch (err) {
+            console.error(`[!] Attempt ${attempt}/${retries} failed to send message to ${jid}: ${err.message}`);
+            if (attempt === retries) {
+                throw err; // Lempar eror jika percobaan terakhir gagal
+            }
+            console.log(`[DEBUG] Retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
 }
 
 async function startBot() {
@@ -332,9 +401,7 @@ async function startBot() {
                 "*.lapor*  -- Kirim Laporan\n\n" +
                 "*[SISTEM]*\n" +
                 "*.ping*     -- Status Bot\n" +
-                "*.runtime*  -- Uptime\n" +
-                "*.cekdb*    -- Statistik DB\n" +
-                "*.panel*    -- Status Server\n\n" +
+                "*.runtime*  -- Uptime\n\n" +
                 "--------------------\n" +
                 "_Ketik perintah di atas untuk memulai_\n" +
                 "*© 2026 www.noxarianet.web.id*";
@@ -366,35 +433,6 @@ async function startBot() {
                     const mt = Math.floor((up % 3600000) / 60000);
                     const s = Math.floor((up % 60000) / 1000);
                     await sendText(remoteJid, "*BOT RUNTIME*\nAktif: *" + h + "h " + mt + "m " + s + "s*", m); break;
-                }
-                case "btn_cekdb":
-                    try {
-                        if (!supabase) throw new Error("Supabase tidak dikonfigurasi");
-                        const { data: orders, error } = await supabase.from("orders").select("*");
-                        if (error) throw error;
-                        const total = orders?.length || 0;
-                        const pending = orders?.filter((o) => o.status === "PENDING").length || 0;
-                        const processing = orders?.filter((o) => o.status === "PROCESSING").length || 0;
-                        const done = orders?.filter((o) => o.status === "COMPLETED").length || 0;
-                        const failed = orders?.filter((o) => o.status === "FAILED").length || 0;
-                        const today = orders?.filter((o) => new Date(o.timestamp).toDateString() === new Date().toDateString()).length || 0;
-                        await sendText(remoteJid,
-                            "*STATISTIK DATABASE*\n" +
-                            "Total: *" + total + "*\nPending: *" + pending + "*\nProcessing: *" + processing + "*\n" +
-                            "Selesai: *" + done + "*\nGagal: *" + failed + "*\nHari Ini: *" + today + "*", m);
-                    } catch (err) { await sendText(remoteJid, "Error DB: " + err.message, m); }
-                    break;
-                case "btn_panel": {
-                    const tot = os.totalmem(), free = os.freemem(), used = tot - free;
-                    const pct = ((used / tot) * 100).toFixed(2);
-                    const up2 = os.uptime();
-                    await sendText(remoteJid,
-                        "*STATUS SERVER*\n" +
-                        "RAM Total: " + (tot / 1024 / 1024 / 1024).toFixed(2) + " GB\n" +
-                        "Terpakai: " + (used / 1024 / 1024 / 1024).toFixed(2) + " GB (" + pct + "%)\n" +
-                        "Bebas: " + (free / 1024 / 1024 / 1024).toFixed(2) + " GB\n" +
-                        "CPU: " + os.cpus().length + " cores\n" +
-                        "Uptime: " + Math.floor(up2 / 3600) + "h " + Math.floor((up2 % 3600) / 60) + "m\n*ONLINE & STABIL*", m); break;
                 }
                 case "btn_lapor":
                     await sendText(remoteJid,
@@ -429,14 +467,11 @@ async function startBot() {
                 setTimeout(() => startBot(), 3000);
             } else if (connection === "open") {
                 console.log("\n=== BOT NOXARIANET AKTIF v5.0 ===\n");
+                await syncTargetGroup(sock);
                 try {
                     const groups = await sock.groupFetchAllParticipating();
                     Object.values(groups).forEach((g, i) => {
                         console.log("   " + (i + 1) + ". " + g.subject + " (ID: " + g.id + ")");
-                        if (g.subject.toLowerCase().includes(GROUP_NAME_KEYWORD)) {
-                            cachedGroupId = g.id;
-                            console.log("   [+] Grup target di-cache: " + g.id);
-                        }
                     });
                 } catch (e) { console.log("[!] Error fetch grup: " + e.message); }
                 console.log("\n[*] Bot siap menerima pesan!\n");
@@ -446,21 +481,7 @@ async function startBot() {
         });
 
         sock.ev.on("group-participants.update", async (anu) => {
-            try {
-                if (anu.action === "add") {
-                    const meta = await sock.groupMetadata(anu.id);
-                    if (meta.subject.toLowerCase().includes(GROUP_NAME_KEYWORD) || anu.id === targetGroupId) {
-                        for (let num of anu.participants) {
-                            try {
-                                await sock.sendMessage(anu.id, {
-                                    text: "Halo @" + num.split("@")[0] + "\n\nSelamat datang di *" + meta.subject + "*!\nKetik *.noxa* untuk lihat layanan kami.",
-                                    mentions: [num],
-                                }, { timeout: 5000 });
-                            } catch (e) { console.error("[!] Gagal greeting:", e.message); }
-                        }
-                    }
-                }
-            } catch (err) { console.error("[!] Error group-participants:", err.message); }
+            // Fitur sambutan/greeting dimatikan sesuai permintaan
         });
 
         sock.ev.on("messages.upsert", async (chatUpdate) => {
@@ -497,8 +518,6 @@ async function startBot() {
                     case "owner": await handleMenuAction("btn_owner", remoteJid, senderNum, m); break;
                     case "order": await handleMenuAction("btn_order", remoteJid, senderNum, m); break;
                     case "runtime": await handleMenuAction("btn_runtime", remoteJid, senderNum, m); break;
-                    case "cekdb": await handleMenuAction("btn_cekdb", remoteJid, senderNum, m); break;
-                    case "panel": await handleMenuAction("btn_panel", remoteJid, senderNum, m); break;
                     case "lapor": await handleMenuAction("btn_lapor", remoteJid, senderNum, m); break;
                     default: break;
                 }
@@ -519,16 +538,6 @@ async function startBot() {
                         return;
                     }
                     const orderPayload = payload.new;
-
-                    // --- DEDUP: Cegah INSERT Realtime terfiring 2x (misal: event "pending" + "insert") ---
-                    const insertNotifKey = orderPayload.id + ":PENDING";
-                    if (notifiedOrderIds.has(insertNotifKey)) {
-                        console.log("[DEBUG] Skipping duplicate INSERT notification for order:", orderPayload.id);
-                        return;
-                    }
-                    // Tandai segera agar event kedua yang mungkin muncul langsung dibuang
-                    notifiedOrderIds.add(insertNotifKey);
-
                     console.log("\n[+] ORDER BARU (INSERT): " + orderPayload.id);
 
                     // Ambil data lengkap order dari database agar data tidak undefined
@@ -539,37 +548,15 @@ async function startBot() {
                         .single();
 
                     if (fetchErr || !order) {
-                        // Kalau fetch gagal, hapus key agar bisa dicoba ulang via polling
-                        notifiedOrderIds.delete(insertNotifKey);
                         console.error("[!] Gagal mengambil detail lengkap order untuk INSERT:", fetchErr?.message);
                         return;
                     }
 
                     if (!isOrderEligibleForCurrentRun(order)) {
-                        notifiedOrderIds.delete(insertNotifKey);
                         console.log("[DEBUG] Skipping INSERT notification for old order:", order.id);
                         return;
                     }
-
-                    const notif =
-                        "*ORDER BARU MASUK!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                        "ID: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                        "Varian: " + (order.variant || "-") + "\n" +
-                        "Harga: *Rp " + Number(order.price || 0).toLocaleString("id-ID") + "*\n" +
-                        "Metode: " + (order.payment_method || "-") + "\n" +
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                        "WA: *" + maskPhone(order.wa_number) + "*\nEmail: " + (order.email ? maskEmail(order.email) : "-") + "\n" +
-                        new Date(order.timestamp || Date.now()).toLocaleString("id-ID") + "\n" +
-                        "_Menunggu pembayaran..._";
-                    try {
-                        const groupId = await resolveGroupId(s);
-                        await sendViaCurrent(groupId, notif);
-                        console.log("[DEBUG] INSERT notif sent, key registered:", insertNotifKey);
-                    } catch (err) {
-                        // Kirim gagal → hapus key agar polling bisa fallback
-                        notifiedOrderIds.delete(insertNotifKey);
-                        console.error("[!] Error notif INSERT:", err.message);
-                    }
+                    console.log("[DEBUG] Order baru diterima via realtime:", order.id, "- notifikasi grup akan dihandle oleh polling");
                 })
                 .subscribe((status) => console.log("[*] Realtime [INSERT]: " + status));
 
@@ -581,18 +568,13 @@ async function startBot() {
                         console.log("[DEBUG] Skipping UPDATE notification because bot is not fully active yet");
                         return;
                     }
+
                     const orderPayload = payload.new;
-                    if (!isOrderEligibleForCurrentRun(orderPayload)) {
-                        console.log("[DEBUG] Skipping UPDATE notification for old order:", orderPayload.id);
-                        return;
-                    }
                     const newStatus = orderPayload.status;
                     const notifKey = orderPayload.id + ":" + newStatus;
                     if (notifiedOrderIds.has(notifKey)) return;
-                    notifiedOrderIds.add(notifKey);
-                    console.log("\n[~] ORDER UPDATE [Realtime]: " + orderPayload.id + " -> " + newStatus);
 
-                    // Ambil data lengkap order dari database agar data tidak undefined
+                    // Ambil data lengkap order dari database agar data tidak undefined dan memiliki timestamp
                     const { data: order, error: fetchErr } = await supabase
                         .from("orders")
                         .select("*")
@@ -600,34 +582,42 @@ async function startBot() {
                         .single();
 
                     if (fetchErr || !order) {
-                        notifiedOrderIds.delete(notifKey);
                         console.error("[!] Gagal mengambil detail lengkap order untuk UPDATE:", fetchErr?.message);
                         return;
                     }
 
-                    if (!isOrderEligibleForCurrentRun(order)) {
-                        notifiedOrderIds.delete(notifKey);
-                        console.log("[DEBUG] Skipping UPDATE notification after fetch for old order:", order.id);
+                    if (!isOrderEligibleForUpdate(order)) {
+                        console.log("[DEBUG] Skipping UPDATE notification for very old order (created > 24h ago):", order.id);
                         return;
                     }
+
+                    notifiedOrderIds.add(notifKey);
+                    console.log("\n[~] ORDER UPDATE [Realtime]: " + order.id + " -> " + newStatus);
 
                     console.log("[DEBUG] wa_number from order:", order.wa_number);
                     const waJid = await resolveRealJid(order.wa_number);
                     console.log("[DEBUG] Resolved waJid:", waJid);
                     try {
+                        let dmFailed = null;
                         if (newStatus === "PROCESSING") {
                             if (waJid) {
-                                console.log("[DEBUG] Sending PROCESSING message to user...");
-                                await sendViaCurrent(waJid,
-                                    "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
-                                    "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
-                                    "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
-                                    "Kami akan langsung kirim detail akun ke sini ya Kak!"
-                                );
+                                try {
+                                    console.log("[DEBUG] Sending PROCESSING message to user...");
+                                    await sendViaCurrent(waJid,
+                                        "*PEMBAYARAN BERHASIL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Halo Kak, pembayaran untuk order *" + order.id + "* telah kami terima.\n\n" +
+                                        "• Produk: *" + order.product + "*\n" +
+                                        "• Varian: *" + (order.variant || "-") + "*\n\n" +
+                                        "Pesanan Kakak sedang disiapkan secara otomatis. Harap tunggu 1-5 menit, detail akun akan segera dikirimkan ke sini."
+                                    );
+                                } catch (e) {
+                                    console.error(`[!] Gagal DM PROCESSING ke user:`, e.message);
+                                    dmFailed = e;
+                                }
                             } else {
                                 console.log("[DEBUG] waJid is null, skipping PROCESSING message to user");
                             }
+                            if (dmFailed) throw dmFailed;
                             return;
                         }
                         if (newStatus === "COMPLETED") {
@@ -646,52 +636,80 @@ async function startBot() {
                                 "Tinggalkan ulasan positif ya Kak!";
 
                             if (waJid) {
-                                console.log("[DEBUG] Sending COMPLETED message to user...");
-                                await sendViaCurrent(waJid,
-                                    "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                                    "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    labelDetail + "\n\n" + fulfillmentText + "\n\n" +
-                                    footerMsg
-                                );
+                                try {
+                                    console.log("[DEBUG] Sending COMPLETED message to user...");
+                                    await sendViaCurrent(waJid,
+                                        "*PESANAN BERHASIL DIKIRIM!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "• Order: *" + order.id + "*\n" +
+                                        "• Produk: *" + order.product + " - " + (order.variant || "-") + "*\n" +
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        labelDetail + "\n" + fulfillmentText + "\n\n" +
+                                        footerMsg
+                                    );
+                                } catch (e) {
+                                    console.error(`[!] Gagal DM COMPLETED ke user:`, e.message);
+                                    dmFailed = e;
+                                }
                             } else {
                                 console.log("[DEBUG] waJid is null, skipping COMPLETED message to user");
                             }
+
                             try {
                                 const gid = await resolveGroupId(s);
                                 console.log("[DEBUG] Sending COMPLETED message to group:", gid);
-                                await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number));
+                                const groupMsg = 
+                                    "*ORDER COMPLETED!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                     "ID: *" + order.id + "*\n" +
+                                     "Produk: *" + order.product + "*\n" +
+                                     "Varian: *" + (order.variant || "-") + "*\n" +
+                                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                     "WA: *" + order.wa_number + "*\n" +
+                                     "Email: *" + (order.email ? maskEmail(order.email) : "-") + "*\n" +
+                                     "Status: *Sukses*";
+                                await sendViaCurrent(gid, groupMsg);
                             } catch (e) { console.error("[!] Error notif grup COMPLETED:", e.message); }
+
+                            if (dmFailed) throw dmFailed;
                             return;
                         }
                         if (newStatus === "FAILED") {
                             try {
                                 const gid = await resolveGroupId(s);
                                 console.log("[DEBUG] Sending FAILED message to group:", gid);
-                                await sendViaCurrent(gid,
+                                const groupMsg = 
                                     "*ORDER GAGAL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "ID: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number) + "\n" +
-                                    "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*"
-                                );
+                                     "ID: *" + order.id + "*\n" +
+                                     "Produk: *" + order.product + "*\n" +
+                                     "Varian: *" + (order.variant || "-") + "*\n" +
+                                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                     "WA: *" + order.wa_number + "*\n" +
+                                     "Email: *" + (order.email ? maskEmail(order.email) : "-") + "*\n" +
+                                     "Detail: *Order gagal karena " + (order.error_message || "terjadi kesalahan sistem") + "*";
+                                await sendViaCurrent(gid, groupMsg);
                             } catch (e) { console.error("[!] Error notif grup FAILED:", e.message); }
+
                             if (waJid) {
-                                console.log("[DEBUG] Sending FAILED message to user...");
-                                let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
-                                    "Tim kami segera menangani masalah ini.\n" +
-                                    "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                    "Mohon maaf atas ketidaknyamanannya";
-                                if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
-                                    failedText = "*MAAF, PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Halo Kak, pesanan Anda dengan ID *" + order.id + "* gagal karena *nomor tujuan salah atau tidak valid*.\n\n" +
-                                        "Saldo telah dikembalikan (refund) ke sistem kami. Silakan hubungi admin di WhatsApp untuk mengoreksi nomor tujuan agar pesanan bisa diproses ulang, atau untuk mengajukan pengembalian dana.\n\n" +
-                                        "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                        "Mohon maaf atas ketidaknyamanannya.";
+                                try {
+                                    console.log("[DEBUG] Sending FAILED message to user...");
+                                    let failedText = "*PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Halo Kak, pesanan *" + order.id + "* mengalami kendala.\n\n" +
+                                        "• Detail: *Order gagal karena " + (order.error_message || "terjadi kesalahan sistem") + "*\n\n" +
+                                        "Tim kami sedang menindaklanjuti. Jika butuh bantuan cepat, silakan hubungi admin: https://wa.me/" + ADMIN_NUMBER;
+                                    if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
+                                        failedText = "*PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                            "Halo Kak, pesanan *" + order.id + "* gagal karena nomor tujuan salah/tidak valid.\n\n" +
+                                            "Saldo telah dikembalikan (refund). Silakan hubungi admin di WhatsApp untuk proses ulang atau refund dana: https://wa.me/" + ADMIN_NUMBER;
+                                    }
+                                    await sendViaCurrent(waJid, failedText);
+                                } catch (e) {
+                                    console.error(`[!] Gagal DM FAILED ke user:`, e.message);
+                                    dmFailed = e;
                                 }
-                                await sendViaCurrent(waJid, failedText);
                             } else {
                                 console.log("[DEBUG] waJid is null, skipping FAILED message to user");
                             }
+
+                            if (dmFailed) throw dmFailed;
                         }
                     } catch (err) {
                         notifiedOrderIds.delete(notifKey);
@@ -756,27 +774,32 @@ async function startBot() {
                                         "Harga: *Rp " + Number(order.price || 0).toLocaleString("id-ID") + "*\n" +
                                         "Metode: " + (order.payment_method || "-") + "\n" +
                                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "WA: *" + maskPhone(order.wa_number) + "*\nEmail: " + (order.email ? maskEmail(order.email) : "-") + "\n" +
+                                        "WA: *" + order.wa_number + "*\nEmail: " + (order.email ? maskEmail(order.email) : "-") + "\n" +
                                         new Date(order.timestamp || Date.now()).toLocaleString("id-ID") + "\n" +
                                         "_Menunggu pembayaran..._";
                                     await sendViaCurrent(gid, notif);
-                                } catch (e) {
-                                    console.error("[!] Error notif grup PENDING polling:", e.message);
-                                    throw e;
-                                }
-                            } else if (order.status === "PROCESSING") {
+                                } catch (e) { console.error("[!] Error notif grup PENDING polling:", e.message); }
+                            }
+                            let dmFailed = null;
+                            if (order.status === "PROCESSING") {
                                 if (waJid) {
-                                    console.log("[DEBUG] [POLLING] Sending PROCESSING message to user...");
-                                    await sendViaCurrent(waJid,
-                                        "*PEMBAYARAN BERHASIL - SEDANG DIPROSES!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Halo Kak!\n\nPembayaran order *" + order.id + "* sudah kami terima!\n" +
-                                        "Produk: *" + order.product + "*\nVarian: " + (order.variant || "-") + "\n\n" +
-                                        "Akun sedang disiapkan secara otomatis...\nEstimasi: *1-5 menit*\n\n" +
-                                        "Kami akan langsung kirim detail akun ke sini ya Kak!"
-                                    );
+                                    try {
+                                        console.log("[DEBUG] [POLLING] Sending PROCESSING message to user...");
+                                        await sendViaCurrent(waJid,
+                                            "*PEMBAYARAN BERHASIL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                            "Halo Kak, pembayaran untuk order *" + order.id + "* telah kami terima.\n\n" +
+                                            "• Produk: *" + order.product + "*\n" +
+                                            "• Varian: *" + (order.variant || "-") + "*\n\n" +
+                                            "Pesanan Kakak sedang disiapkan secara otomatis. Harap tunggu 1-5 menit, detail akun akan segera dikirimkan ke sini."
+                                        );
+                                    } catch (e) {
+                                        console.error(`[!] [POLLING] Gagal DM PROCESSING ke user:`, e.message);
+                                        dmFailed = e;
+                                    }
                                 } else {
                                     console.log("[DEBUG] [POLLING] waJid is null, skipping PROCESSING message");
                                 }
+                                if (dmFailed) throw dmFailed;
                             } else if (order.status === "COMPLETED") {
                                 const details = order.account_details || {};
                                 const rawItems = details.raw_items || [];
@@ -785,63 +808,91 @@ async function startBot() {
                                 const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
                                 const footerMsg = isH2H
                                     ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Terima kasih sudah berbelanja di *noxarianet store*!"
+                                    "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                    "Tinggalkan ulasan positif ya Kak!"
                                     : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                                     "_Jangan share akun ini ke orang lain!_\n" +
-                                    "Terima kasih sudah berbelanja di *noxarianet store*!";
+                                    "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                    "Tinggalkan ulasan positif ya Kak!";
 
                                 if (waJid) {
-                                    console.log("[DEBUG] [POLLING] Sending COMPLETED message to user...");
-                                    await sendViaCurrent(waJid,
-                                        "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                                        "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        labelDetail + "\n\n" + fulfillmentText + "\n\n" +
-                                        footerMsg
-                                    );
+                                    try {
+                                        console.log("[DEBUG] [POLLING] Sending COMPLETED message to user...");
+                                        await sendViaCurrent(waJid,
+                                            "*PESANAN BERHASIL DIKIRIM!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                             "• Order: *" + order.id + "*\n" +
+                                             "• Produk: *" + order.product + " - " + (order.variant || "-") + "*\n" +
+                                             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                             labelDetail + "\n" + fulfillmentText + "\n\n" +
+                                             footerMsg
+                                         );
+                                    } catch (e) {
+                                        console.error(`[!] [POLLING] Gagal DM COMPLETED ke user:`, e.message);
+                                        dmFailed = e;
+                                    }
                                 } else {
                                     console.log("[DEBUG] [POLLING] waJid is null, skipping COMPLETED message");
                                 }
                                 try {
                                     const gid = await resolveGroupId(currentSock);
                                     console.log("[DEBUG] [POLLING] Sending COMPLETED message to group:", gid);
-                                    await sendViaCurrent(gid, "ORDER COMPLETED: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number));
+                                    const groupMsg = 
+                                        "*ORDER COMPLETED!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "ID: *" + order.id + "*\n" +
+                                        "Produk: *" + order.product + "*\n" +
+                                        "Varian: *" + (order.variant || "-") + "*\n" +
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "WA: *" + order.wa_number + "*\n" +
+                                        "Email: *" + (order.email ? maskEmail(order.email) : "-") + "*\n" +
+                                        "Status: *Sukses*";
+                                    await sendViaCurrent(gid, groupMsg);
                                 } catch (e) { console.error("[!] Error notif grup COMPLETED polling:", e.message); }
+                                if (dmFailed) throw dmFailed;
                             } else if (order.status === "FAILED") {
                                 try {
                                     const gid = await resolveGroupId(currentSock);
                                     console.log("[DEBUG] [POLLING] Sending FAILED message to group:", gid);
-                                    await sendViaCurrent(gid,
+                                    const groupMsg = 
                                         "*ORDER GAGAL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "ID: *" + order.id + "*\n" + order.product + "\nWA: " + maskPhone(order.wa_number) + "\n" +
-                                        "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*"
-                                    );
+                                        "ID: *" + order.id + "*\n" +
+                                        "Produk: *" + order.product + "*\n" +
+                                        "Varian: *" + (order.variant || "-") + "*\n" +
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "WA: *" + order.wa_number + "*\n" +
+                                        "Email: *" + (order.email ? maskEmail(order.email) : "-") + "*\n" +
+                                        "Detail: *Order gagal karena " + (order.error_message || "terjadi kesalahan sistem") + "*";
+                                    await sendViaCurrent(gid, groupMsg);
                                 } catch (e) { console.error("[!] Error notif grup FAILED polling:", e.message); }
                                 if (waJid) {
-                                    console.log("[DEBUG] [POLLING] Sending FAILED message to user...");
-                                    let failedText = "*MAAF, PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                        "Halo Kak, ada kendala pada pesanan *" + order.id + "*.\n\n" +
-                                        "Tim kami segera menangani masalah ini.\n" +
-                                        "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                        "Mohon maaf atas ketidaknyamanannya";
-                                    if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
-                                        failedText = "*MAAF, PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                            "Halo Kak, pesanan Anda dengan ID *" + order.id + "* gagal karena *nomor tujuan salah atau tidak valid*.\n\n" +
-                                            "Saldo telah dikembalikan (refund) ke sistem kami. Silakan hubungi admin di WhatsApp untuk mengoreksi nomor tujuan agar pesanan bisa diproses ulang, atau untuk mengajukan pengembalian dana.\n\n" +
-                                            "Hubungi admin: https://wa.me/" + ADMIN_NUMBER + "\n" +
-                                            "Mohon maaf atas ketidaknyamanannya.";
+                                    try {
+                                        console.log("[DEBUG] [POLLING] Sending FAILED message to user...");
+                                         let failedText = "*PESANAN GAGAL DIPROSES*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                             "Halo Kak, pesanan *" + order.id + "* mengalami kendala.\n\n" +
+                                             "• Detail: *Order gagal karena " + (order.error_message || "terjadi kesalahan sistem") + "*\n\n" +
+                                             "Tim kami sedang menindaklanjuti. Jika butuh bantuan cepat, silakan hubungi admin: https://wa.me/" + ADMIN_NUMBER;
+                                         if (order.error_message?.toLowerCase().includes("nomor tujuan salah") || order.error_message?.toLowerCase().includes("refund")) {
+                                             failedText = "*PESANAN GAGAL (REFUND)*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                                 "Halo Kak, pesanan *" + order.id + "* gagal karena nomor tujuan salah/tidak valid.\n\n" +
+                                                 "Saldo telah dikembalikan (refund). Silakan hubungi admin di WhatsApp untuk proses ulang atau refund dana: https://wa.me/" + ADMIN_NUMBER;
+                                         }
+                                        await sendViaCurrent(waJid, failedText);
+                                    } catch (e) {
+                                        console.error(`[!] [POLLING] Gagal DM FAILED ke user:`, e.message);
+                                        dmFailed = e;
                                     }
-                                    await sendViaCurrent(waJid, failedText);
                                 } else {
                                     console.log("[DEBUG] [POLLING] waJid is null, skipping FAILED message to user");
                                 }
+                                if (dmFailed) throw dmFailed;
                             }
                         } catch (sendErr) {
                             notifiedOrderIds.delete(notifKey);
                             console.error("[!] [POLLING] Gagal kirim notif " + order.id + ", akan retry:", sendErr.message);
                         }
                     }
-                } catch (err) { /* silent */ }
+                } catch (err) {
+                    console.error("[!] [POLLING] Error in polling loop:", err.message);
+                }
             }, 10000);
         }
 
