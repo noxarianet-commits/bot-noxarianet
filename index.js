@@ -66,7 +66,7 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
     console.warn("[!] SUPABASE belum dikonfigurasi di .env");
 }
 
-const GROUP_NAME_KEYWORD = "noxarianet";
+const GROUP_NAME_KEYWORD = "BUKTI TRANSAKSI | noxarianet store";
 const ADMIN_NUMBER = "6285936603517";
 
 let supabaseSubscribed = false;
