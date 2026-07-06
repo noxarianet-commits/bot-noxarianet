@@ -69,11 +69,9 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
 const GROUP_NAME_KEYWORD = "BUKTI TRANSAKSI | noxarianet store";
 const ADMIN_NUMBER = "6285936603517";
 
-// ======================== PERUBAHAN DI SINI ========================
-// GANTI targetGroupId dengan ID grup baru
-// Cara dapatkan: jalankan bot, lihat console, copy ID grup "BUKTI TRANSAKSI | noxarianet store"
-// Format: 1203634XXXXXXXXXX@g.us
-const targetGroupId = "120363428192718440@g.us"; // <-- GANTI DENGAN ID NYATA!
+// ======================== SUDAH DIGANTI DENGAN ID BENAR ========================
+// ID grup "BUKTI TRANSAKSI | noxarianet store" dari log console
+const targetGroupId = "120363428192718440@g.us";
 // ===================================================================
 
 let supabaseSubscribed = false;
@@ -283,11 +281,9 @@ function formatFulfillmentDetails(order) {
     return "_Detail akun tidak tersedia. Hubungi admin._";
 }
 
-// ======================== PERUBAHAN DI SINI ========================
-// Fungsi resolveGroupId sekarang PAKAI HARDCODE LANGSUNG
-// Tidak perlu mendeteksi grup lagi, langsung kirim ke targetGroupId
+// ======================== FUNGSI RESOLVE GROUP ID ========================
+// Langsung pakai hardcode, tidak deteksi grup
 async function resolveGroupId(sock) {
-    // Langsung pakai hardcoded ID, abaikan deteksi grup
     console.log(`[DEBUG] Sending to target group: ${targetGroupId}`);
     cachedGroupId = targetGroupId;
     return targetGroupId;
@@ -306,11 +302,11 @@ async function sendViaCurrent(jid, text, retries = 3, delay = 1500) {
         try {
             await currentSock.sendMessage(jid, { text });
             console.log(`[DEBUG] SUCCESS: Message sent to ${jid} on attempt ${attempt}/${retries}`);
-            return; // Berhasil, keluar dari fungsi
+            return;
         } catch (err) {
             console.error(`[!] Attempt ${attempt}/${retries} failed to send message to ${jid}: ${err.message}`);
             if (attempt === retries) {
-                throw err; // Lempar eror jika percobaan terakhir gagal
+                throw err;
             }
             console.log(`[DEBUG] Retrying in ${delay}ms...`);
             await new Promise(resolve => setTimeout(resolve, delay));
@@ -467,32 +463,29 @@ async function startBot() {
 
                 if (statusCode === DisconnectReason.loggedOut) {
                     console.log("    [!] Terdeteksi logout, menghapus semua file auth!");
-                    cleanSessionFiles(true); // Clean everything including creds.json
+                    cleanSessionFiles(true);
                     console.log("    [!] Silakan restart bot dan scan QR ulang.");
-                    return; // Jangan reconnect jika logout
+                    return;
                 }
 
                 console.log("    [*] Reconnecting in 3 seconds...");
                 setTimeout(() => startBot(), 3000);
             } else if (connection === "open") {
                 console.log("\n=== BOT NOXARIANET AKTIF v5.0 ===\n");
-
-                // ======================== PERUBAHAN DI SINI ========================
-                // TAMPILKAN DAFTAR GRUP UNTUK REFERENSI (TAPI TIDAK DIPAKAI UNTUK PENGIRIMAN)
+                
                 try {
                     const groups = await sock.groupFetchAllParticipating();
                     console.log("📋 DAFTAR GRUP YANG DIJOIN BOT:");
                     Object.values(groups).forEach((g, i) => {
                         const isTarget = g.id === targetGroupId;
                         const marker = isTarget ? " ✅ TARGET" : "";
-                        console.log(`   ${i + 1}. ${g.subject} (ID: ${g.id})${marker}`);
+                        console.log(`   ${i+1}. ${g.subject} (ID: ${g.id})${marker}`);
                     });
                     console.log(`[+] Target group ID: ${targetGroupId}`);
-                } catch (e) {
-                    console.log("[!] Error fetch grup: " + e.message);
+                } catch (e) { 
+                    console.log("[!] Error fetch grup: " + e.message); 
                 }
-                // ===================================================================
-
+                
                 console.log("\n[*] Bot siap menerima pesan!\n");
                 setBotActivationTime();
                 setOrderNotificationsReady(true, "connection open");
@@ -503,10 +496,7 @@ async function startBot() {
             try {
                 if (anu.action === "add") {
                     const meta = await sock.groupMetadata(anu.id);
-                    // ======================== PERUBAHAN DI SINI ========================
-                    // Cek apakah grup yang dimaksud adalah targetGroupId
                     if (anu.id === targetGroupId) {
-                        // ===================================================================
                         for (let num of anu.participants) {
                             try {
                                 await sock.sendMessage(anu.id, {
@@ -578,7 +568,6 @@ async function startBot() {
                     const orderPayload = payload.new;
                     console.log("\n[+] ORDER BARU (INSERT): " + orderPayload.id);
 
-                    // Ambil data lengkap order dari database agar data tidak undefined
                     const { data: order, error: fetchErr } = await supabase
                         .from("orders")
                         .select("*")
@@ -612,7 +601,6 @@ async function startBot() {
                     const notifKey = orderPayload.id + ":" + newStatus;
                     if (notifiedOrderIds.has(notifKey)) return;
 
-                    // Ambil data lengkap order dari database agar data tidak undefined dan memiliki timestamp
                     const { data: order, error: fetchErr } = await supabase
                         .from("orders")
                         .select("*")
@@ -746,10 +734,6 @@ async function startBot() {
         }
 
         // POLLING FALLBACK
-        // FIX 1: pollingStarted guard - SATU interval meski startBot() dipanggil ulang saat reconnect
-        // FIX 2: currentSock.user check - cegah "Connection Closed" saat koneksi belum siap
-        // FIX 3: sendViaCurrent - pakai currentSock langsung (bukan closure sock lama yang sudah mati)
-        // FIX 4: notifiedOrderIds.delete on error - agar gagal send bisa di-retry
         if (!pollingStarted) {
             pollingStarted = true;
 
