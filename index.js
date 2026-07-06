@@ -73,7 +73,7 @@ const ADMIN_NUMBER = "6285936603517";
 // GANTI targetGroupId dengan ID grup baru
 // Cara dapatkan: jalankan bot, lihat console, copy ID grup "BUKTI TRANSAKSI | noxarianet store"
 // Format: 1203634XXXXXXXXXX@g.us
-const targetGroupId = "1203634XXXXXXXXXX@g.us"; // <-- GANTI DENGAN ID NYATA!
+const targetGroupId = "120363428192718440@g.us"; // <-- GANTI DENGAN ID NYATA!
 // ===================================================================
 
 let supabaseSubscribed = false;
