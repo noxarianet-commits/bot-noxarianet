@@ -278,6 +278,31 @@ function formatFulfillmentDetails(order) {
     return "_Detail akun tidak tersedia. Hubungi admin._";
 }
 
+/**
+ * Detects if an order is a "premium app" (non-H2H, non-Fincloud auto product)
+ * that should NOT have account details shown in group messages.
+ *
+ * Premium apps have raw_items with order_process like "auto" and contain
+ * licenses with credentials. Fincloud orders have "rrn" at root level.
+ * H2H/SMM orders have order_process "h2h" or "smm".
+ */
+function isPremiumApp(order) {
+    const details = order.account_details || {};
+
+    // Fincloud orders have "rrn" at root level of account_details
+    if (details.rrn) return false;
+
+    const rawItems = details.raw_items || [];
+    if (rawItems.length === 0) return false;
+
+    // If any item is h2h or smm, it's NOT a premium app
+    const hasH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
+    if (hasH2H) return false;
+
+    // Remaining auto/manual items with licenses are premium apps
+    return true;
+}
+
 // =============================================
 // RESOLVE GROUP ID - HARDCODE
 // =============================================
@@ -640,6 +665,25 @@ async function startBot() {
                         const gid = await resolveGroupId(s);
 
                         if (newStatus === "COMPLETED") {
+                            console.log("[DEBUG] Sending COMPLETED message to group:", gid);
+
+                            // Premium apps: hide account details in group
+                            if (isPremiumApp(order)) {
+                                await sendViaCurrent(gid,
+                                    "*PESANAN SELESAI!* ✅\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                    "Order: *" + order.id + "*\n" +
+                                    "Produk: *" + order.product + "*\n" +
+                                    "Varian: " + (order.variant || "-") + "\n" +
+                                    "WA: " + (order.wa_number || "-") + "\n" +
+                                    "Email: " + (order.email || "-") + "\n" +
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                    "_Detail akun dikirim via email._\n" +
+                                    "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
+                                    "Tinggalkan ulasan positif ya Kak!"
+                                );
+                                return;
+                            }
+
                             const details = order.account_details || {};
                             const rawItems = details.raw_items || [];
                             const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
@@ -654,10 +698,6 @@ async function startBot() {
                                 "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
                                 "Tinggalkan ulasan positif ya Kak!";
 
-                            // =============================================
-                            // KIRIM KE GRUP SAJA - DATA ASLI (TANPA MASKING)
-                            // =============================================
-                            console.log("[DEBUG] Sending COMPLETED message to group:", gid);
                             await sendViaCurrent(gid,
                                 "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
                                 "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
@@ -731,28 +771,44 @@ async function startBot() {
                             const gid = await resolveGroupId(currentSock);
 
                             if (order.status === "COMPLETED") {
-                                const details = order.account_details || {};
-                                const rawItems = details.raw_items || [];
-                                const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
-                                const fulfillmentText = formatFulfillmentDetails(order);
-                                const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
-                                const footerMsg = isH2H
-                                    ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Terima kasih sudah berbelanja di *noxarianet store*!"
-                                    : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "_Jangan share akun ini ke orang lain!_\n" +
-                                    "Terima kasih sudah berbelanja di *noxarianet store*!";
-
                                 console.log("[DEBUG] [POLLING] Sending COMPLETED message to group:", gid);
-                                await sendViaCurrent(gid,
-                                    "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                                    "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    labelDetail + "\n\n" + fulfillmentText + "\n\n" +
-                                    "WA: " + (order.wa_number || "-") + "\n" +
-                                    "Email: " + (order.email || "-") + "\n\n" +
-                                    footerMsg
-                                );
+
+                                // Premium apps: hide account details in group
+                                if (isPremiumApp(order)) {
+                                    await sendViaCurrent(gid,
+                                        "*PESANAN SELESAI!* ✅\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Order: *" + order.id + "*\n" +
+                                        "Produk: *" + order.product + "*\n" +
+                                        "Varian: " + (order.variant || "-") + "\n" +
+                                        "WA: " + (order.wa_number || "-") + "\n" +
+                                        "Email: " + (order.email || "-") + "\n" +
+                                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "_Detail akun dikirim via email._\n" +
+                                        "Terima kasih sudah berbelanja di *noxarianet store*!"
+                                    );
+                                } else {
+                                    const details = order.account_details || {};
+                                    const rawItems = details.raw_items || [];
+                                    const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
+                                    const fulfillmentText = formatFulfillmentDetails(order);
+                                    const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
+                                    const footerMsg = isH2H
+                                        ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Terima kasih sudah berbelanja di *noxarianet store*!"
+                                        : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "_Jangan share akun ini ke orang lain!_\n" +
+                                        "Terima kasih sudah berbelanja di *noxarianet store*!";
+
+                                    await sendViaCurrent(gid,
+                                        "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
+                                        "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                                        labelDetail + "\n\n" + fulfillmentText + "\n\n" +
+                                        "WA: " + (order.wa_number || "-") + "\n" +
+                                        "Email: " + (order.email || "-") + "\n\n" +
+                                        footerMsg
+                                    );
+                                }
                             } else if (order.status === "FAILED") {
                                 console.log("[DEBUG] [POLLING] Sending FAILED message to group:", gid);
                                 await sendViaCurrent(gid,
