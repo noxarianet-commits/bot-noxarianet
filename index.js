@@ -438,7 +438,7 @@ async function startBot() {
                 case "btn_cekdb":
                     try {
                         if (!supabase) throw new Error("Supabase tidak dikonfigurasi");
-                        const { data: orders, error } = await supabase.from("orders").select("*");
+                        const { data: orders, error } = await supabase.from("orders").select("status, timestamp");
                         if (error) throw error;
                         const total = orders?.length || 0;
                         const pending = orders?.filter((o) => o.status === "PENDING").length || 0;
@@ -595,16 +595,8 @@ async function startBot() {
                     const orderPayload = payload.new;
                     console.log("\n[+] ORDER BARU (INSERT): " + orderPayload.id);
 
-                    const { data: order, error: fetchErr } = await supabase
-                        .from("orders")
-                        .select("*")
-                        .eq("id", orderPayload.id)
-                        .single();
-
-                    if (fetchErr || !order) {
-                        console.error("[!] Gagal mengambil detail lengkap order untuk INSERT:", fetchErr?.message);
-                        return;
-                    }
+                    const order = orderPayload;
+                    if (!order) return;
 
                     if (!isOrderEligibleForCurrentRun(order)) {
                         console.log("[DEBUG] Skipping INSERT notification for old order:", order.id);
@@ -642,16 +634,8 @@ async function startBot() {
                     const notifKey = orderPayload.id + ":" + newStatus;
                     if (notifiedOrderIds.has(notifKey)) return;
 
-                    const { data: order, error: fetchErr } = await supabase
-                        .from("orders")
-                        .select("*")
-                        .eq("id", orderPayload.id)
-                        .single();
-
-                    if (fetchErr || !order) {
-                        console.error("[!] Gagal mengambil detail lengkap order untuk UPDATE:", fetchErr?.message);
-                        return;
-                    }
+                    const order = orderPayload;
+                    if (!order) return;
 
                     if (!isOrderEligibleForUpdate(order)) {
                         console.log("[DEBUG] Skipping UPDATE notification for very old order (created > 24h ago):", order.id);
