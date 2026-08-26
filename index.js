@@ -7,6 +7,7 @@ const {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
+    Browsers,
 } = require("@whiskeysockets/baileys");
 const { createClient } = require("@supabase/supabase-js");
 const qrcode = require("qrcode-terminal");
@@ -15,16 +16,29 @@ const pino = require("pino");
 const WebSocket = require("ws");
 const os = require("os");
 const fs = require("fs");
+const path = require("path");
+const readline = require("readline");
 require("dotenv").config();
 
+// =============================================
+// KONFIGURASI SESI & LOGIN
+// Path absolut agar sesi selalu ditemukan
+// apapun working directory saat bot dijalankan.
+// =============================================
+const AUTH_DIR = path.join(__dirname, "auth_info_baileys");
+
+let shuttingDown = false;
+let consecutiveLogouts = 0;
+let reconnectAttempts = 0;
+let pairingCodeRequested = false;
+
 function cleanSessionFiles(forceFullClean = false) {
-    const authDir = "auth_info_baileys";
-    if (fs.existsSync(authDir)) {
+    if (fs.existsSync(AUTH_DIR)) {
         try {
-            const files = fs.readdirSync(authDir);
+            const files = fs.readdirSync(AUTH_DIR);
             for (const file of files) {
                 if (forceFullClean || file !== "creds.json") {
-                    const filePath = authDir + "/" + file;
+                    const filePath = path.join(AUTH_DIR, file);
                     fs.rmSync(filePath, { force: true, recursive: true });
                     console.log("[+] Menghapus file sesi:", file);
                 }
@@ -38,6 +52,69 @@ function cleanSessionFiles(forceFullClean = false) {
             console.error("[!] Gagal membersihkan file sesi:", e.message);
         }
     }
+}
+
+// =============================================
+// METODE LOGIN: QR atau OTP (PAIRING CODE)
+// Prioritas: argumen CLI -> env -> prompt interaktif
+//   CLI : node index.js otp   |  node index.js --qr
+//   ENV : LOGIN_METHOD=otp, PHONE_NUMBER=628xxxx
+// =============================================
+function normalizePhoneNumber(input) {
+    let num = (input || "").toString().replace(/\D/g, "");
+    if (!num) return null;
+    if (num.startsWith("6262")) num = num.slice(2);
+    if (num.startsWith("0")) num = "62" + num.slice(1);
+    else if (num.startsWith("620")) num = "62" + num.slice(3);
+    else if (!num.startsWith("62")) num = "62" + num;
+    if (num.length < 9 || num.length > 15) return null;
+    return num;
+}
+
+async function askQuestion(query) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise((resolve) => {
+        rl.question(query, (ans) => {
+            rl.close();
+            resolve((ans || "").trim());
+        });
+    });
+}
+
+async function resolveLoginConfig() {
+    const args = process.argv.slice(2).map(a => a.toLowerCase().replace(/^--?/, ""));
+    let method = null;
+    if (args.includes("otp") || args.includes("pairing")) method = "otp";
+    else if (args.includes("qr")) method = "qr";
+    else if (process.env.LOGIN_METHOD) {
+        const envMethod = process.env.LOGIN_METHOD.toLowerCase();
+        if (envMethod === "otp" || envMethod === "pairing") method = "otp";
+        else if (envMethod === "qr") method = "qr";
+    }
+
+    let phoneNumber = process.env.PHONE_NUMBER || null;
+
+    // Hanya tanya lewat terminal jika sesi belum terdaftar
+    const registered = fs.existsSync(path.join(AUTH_DIR, "creds.json")) &&
+        (() => { try { return JSON.parse(fs.readFileSync(path.join(AUTH_DIR, "creds.json"), "utf8")).registered === true; } catch { return false; } })();
+
+    if (!registered && !method && process.stdin.isTTY) {
+        const answer = await askQuestion("[?] Metode login (ketik 'otp' untuk kode pairing, Enter untuk QR): ");
+        if (answer.toLowerCase() === "otp" || answer.toLowerCase() === "pairing") method = "otp";
+        else method = "qr";
+    }
+    if (!method) method = "qr";
+
+    if (method === "otp" && !phoneNumber && process.stdin.isTTY) {
+        const answer = await askQuestion("[?] Masukkan nomor WA bot (format internasional tanpa +, contoh 6281234567890): ");
+        phoneNumber = normalizePhoneNumber(answer);
+        while (!phoneNumber) {
+            const retry = await askQuestion("[!] Nomor tidak valid. Coba lagi (contoh 6281234567890): ");
+            phoneNumber = normalizePhoneNumber(retry);
+        }
+    }
+
+    return { method, phoneNumber: phoneNumber ? normalizePhoneNumber(phoneNumber) : null };
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -55,6 +132,21 @@ process.on("uncaughtException", (err) => {
         console.log("[!] Mendeteksi Bad MAC error di background. Mengabaikan agar bot tetap berjalan...");
     }
 });
+
+// =============================================
+// GRACEFUL SHUTDOWN - pastikan creds tersimpan
+// sebelum proses berhenti (mencegah sesi korup
+// yang memaksa login ulang setiap restart)
+// =============================================
+function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n[*] Menerima ${signal}. Menutup koneksi WhatsApp dengan aman...`);
+    try { currentSock?.end(new Error("graceful shutdown")); } catch (e) { /* ignore */ }
+    setTimeout(() => process.exit(0), 1500);
+}
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 let supabase;
 if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
@@ -342,15 +434,31 @@ async function sendViaCurrent(jid, text, retries = 3, delay = 1500) {
 async function startBot() {
     try {
         setOrderNotificationsReady(false, "initializing socket");
-        const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
-        const { version } = await fetchLatestBaileysVersion();
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+        let version;
+        try {
+            ({ version } = await fetchLatestBaileysVersion());
+        } catch (e) {
+            console.warn("[!] Gagal fetch versi WA terbaru (offline?), memakai versi bawaan Baileys.");
+        }
+
+        const loginConfig = await resolveLoginConfig();
+        if (!state.creds.registered) {
+            console.log(`[*] Sesi belum terdaftar. Metode login: ${loginConfig.method.toUpperCase()}${loginConfig.method === "otp" ? ` untuk ${loginConfig.phoneNumber}` : ""}`);
+        }
 
         const sock = makeWASocket({
             version,
             logger: pino({ level: "silent" }),
             auth: state,
-            browser: ["noxarianet Bot", "Safari", "5.0"],
+            // Browser standar yang dikenali WhatsApp agar tidak mudah di-logout
+            browser: Browsers.ubuntu("Chrome"),
+            printQRInTerminal: false,
             syncFullHistory: false,
+            markOnlineOnConnect: true,
+            keepAliveIntervalMs: 30000,
+            connectTimeoutMs: 30000,
+            defaultQueryTimeoutMs: 60000,
         });
         currentSock = sock;
         sock.ev.on("creds.update", saveCreds);
@@ -474,28 +582,98 @@ async function startBot() {
 
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update;
-            if (qr) {
-                console.log("\n=== SCAN QR CODE WHATSAPP ANDA ===\n");
-                qrcode.generate(qr, { small: true });
+            if (qr && !sock.authState.creds.registered) {
+                if (loginConfig.method === "otp") {
+                    // =============================================
+                    // LOGIN OTP (PAIRING CODE)
+                    // Kode 8 digit dimasukkan di WA:
+                    // Perangkat Tertaut > Tautkan Perangkat > Tautkan dengan nomor telepon
+                    // =============================================
+                    if (!pairingCodeRequested) {
+                        pairingCodeRequested = true;
+                        setTimeout(async () => {
+                            try {
+                                let phoneNumber = loginConfig.phoneNumber;
+                                if (!phoneNumber && !process.stdin.isTTY) {
+                                    console.error("[!] Mode OTP butuh nomor telepon. Set PHONE_NUMBER=628xxxx di .env");
+                                    console.error("[!] atau jalankan manual: node index.js otp");
+                                    pairingCodeRequested = false;
+                                    return;
+                                }
+                                while (!phoneNumber) {
+                                    const answer = await askQuestion("[?] Masukkan nomor WA bot (contoh 6281234567890): ");
+                                    phoneNumber = normalizePhoneNumber(answer);
+                                    if (!phoneNumber) console.log("[!] Nomor tidak valid. Gunakan format internasional tanpa +.");
+                                }
+                                console.log(`[*] Meminta kode pairing untuk ${phoneNumber}...`);
+                                const code = await sock.requestPairingCode(phoneNumber);
+                                console.log("\n==============================================");
+                                console.log("  KODE PAIRING ANDA:  " + code?.match(/.{1,4}/g)?.join("-"));
+                                console.log("  Buka WhatsApp > Perangkat Tertaut >");
+                                console.log("  Tautkan Perangkat > Tautkan dengan");
+                                console.log("  nomor telepon, lalu masukkan kode ini.");
+                                console.log("==============================================\n");
+                            } catch (e) {
+                                pairingCodeRequested = false;
+                                console.error("[!] Gagal meminta kode pairing:", e.message);
+                                console.log("[!] Bot akan mencoba lagi pada pembaruan koneksi berikutnya...");
+                            }
+                        }, 3000);
+                    }
+                } else {
+                    console.log("\n=== SCAN QR CODE WHATSAPP ANDA ===\n");
+                    qrcode.generate(qr, { small: true });
+                }
             }
             if (connection === "close") {
                 setOrderNotificationsReady(false, "connection closed");
+                if (shuttingDown) return;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const errorMsg = lastDisconnect?.error?.message || 'Unknown error';
                 console.log("\n[-] Koneksi terputus!");
                 console.log("    Status Code:", statusCode);
                 console.log("    Error:", errorMsg);
 
-                if (statusCode === DisconnectReason.loggedOut) {
-                    console.log("    [!] Terdeteksi logout, menghapus semua file auth!");
-                    cleanSessionFiles(true);
-                    console.log("    [!] Silakan restart bot dan scan QR ulang.");
+                if (statusCode === DisconnectReason.restartRequired || errorMsg.toLowerCase().includes("restart required")) {
+                    console.log("    [*] Restart diperlukan oleh server, reconnect cepat...");
+                    setTimeout(() => startBot(), 1500);
                     return;
                 }
 
-                console.log("    [*] Reconnecting in 3 seconds...");
-                setTimeout(() => startBot(), 3000);
+                if (statusCode === DisconnectReason.badSession || statusCode === DisconnectReason.multideviceMismatch) {
+                    console.log("    [!] Sesi korup/mismatch, membersihkan file sesi & login ulang...");
+                    cleanSessionFiles(true);
+                    pairingCodeRequested = false;
+                    setTimeout(() => startBot(), 3000);
+                    return;
+                }
+
+                if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
+                    consecutiveLogouts++;
+                    console.log(`    [!] Terdeteksi logout (${consecutiveLogouts}x).`);
+                    // Jangan langsung hapus sesi: 401 kadang muncul spurius.
+                    // Coba reconnect dulu; hapus sesi hanya jika logout berulang.
+                    if (consecutiveLogouts >= 2) {
+                        console.log("    [!] Logout berulang - sesi benar-benar tidak valid.");
+                        console.log("    [!] Menghapus semua file auth. Silakan restart bot dan login ulang.");
+                        cleanSessionFiles(true);
+                        consecutiveLogouts = 0;
+                        pairingCodeRequested = false;
+                        return;
+                    }
+                    console.log("    [*] Mencoba reconnect dengan sesi yang ada...");
+                    setTimeout(() => startBot(), 5000);
+                    return;
+                }
+
+                reconnectAttempts++;
+                const delay = Math.min(3000 * reconnectAttempts, 30000);
+                console.log(`    [*] Reconnecting in ${delay / 1000} seconds...`);
+                setTimeout(() => startBot(), delay);
             } else if (connection === "open") {
+                consecutiveLogouts = 0;
+                reconnectAttempts = 0;
+                pairingCodeRequested = false;
                 console.log("\n=== BOT NOXARIANET AKTIF v5.0 ===\n");
 
                 try {
@@ -714,7 +892,7 @@ async function startBot() {
 
     } catch (err) {
         console.error("\n[!] ERROR FATAL:", err.message);
-        setTimeout(() => startBot(), 5000);
+        if (!shuttingDown) setTimeout(() => startBot(), 5000);
     }
 }
 
@@ -728,5 +906,7 @@ module.exports = {
         setBotActivationTime,
         getOrderTimestamp,
         isOrderEligibleForCurrentRun,
+        normalizePhoneNumber,
+        resolveLoginConfig,
     },
 };
