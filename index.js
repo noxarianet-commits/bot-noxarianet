@@ -20,6 +20,15 @@ const path = require("path");
 const readline = require("readline");
 require("dotenv").config();
 
+// Notifikasi Telegram (Opsi A: axios-only, independen dari koneksi WA)
+const {
+    isTelegramReady,
+    sendTelegram,
+    logStatus: logTelegramStatus,
+    notifyTelegramStatus,
+} = require("./lib/telegram");
+const { buildCompletedMessage, buildFailedMessage } = require("./lib/messages");
+
 // =============================================
 // KONFIGURASI SESI & LOGIN
 // Path absolut agar sesi selalu ditemukan
@@ -157,6 +166,9 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
 } else {
     console.warn("[!] SUPABASE belum dikonfigurasi di .env");
 }
+
+// Telegram: independen dari WA, cukup butuh TOKEN + CHAT_ID di .env
+logTelegramStatus();
 
 const GROUP_NAME_KEYWORD = "BUKTI TRANSAKSI | noxarianet store";
 const ADMIN_NUMBER = "6285936603517";
@@ -430,6 +442,60 @@ async function sendViaCurrent(jid, text, retries = 3, delay = 1500) {
     }
 }
 
+// =============================================
+// DUAL-SEND: WA + Telegram (independen satu sama lain)
+// Gagal di satu channel tidak menggagalkan channel lain.
+// =============================================
+function isWaReady() {
+    return Boolean(orderNotificationsReady && currentSock?.user);
+}
+
+async function notifyDual({ waJid, waText, tgHtml, orderId, kind }) {
+    const tasks = [];
+
+    if (waText) {
+        if (isWaReady()) {
+            tasks.push(
+                sendViaCurrent(waJid, waText).then(
+                    () => ({ channel: "WA", ok: true }),
+                    (err) => ({ channel: "WA", ok: false, error: err.message })
+                )
+            );
+        } else {
+            console.log(`[DEBUG] Skipping WA send for ${orderId} (${kind}): WA not ready, Telegram tetap jalan`);
+        }
+    }
+
+    if (tgHtml) {
+        if (isTelegramReady()) {
+            tasks.push(
+                sendTelegram(tgHtml).then(
+                    () => ({ channel: "TG", ok: true }),
+                    (err) => ({ channel: "TG", ok: false, error: err.message })
+                )
+            );
+        } else {
+            console.log(`[DEBUG] Skipping Telegram send for ${orderId} (${kind}): Telegram not ready`);
+        }
+    }
+
+    if (tasks.length === 0) {
+        throw new Error("Tidak ada channel siap (WA dan Telegram sama-sama not ready)");
+    }
+
+    const results = await Promise.all(tasks);
+    for (const r of results) {
+        if (r.ok) console.log(`[DEBUG] SUCCESS: ${orderId} (${kind}) terkirim via ${r.channel}`);
+        else console.error(`[!] Gagal kirim ${orderId} (${kind}) via ${r.channel}: ${r.error}`);
+    }
+
+    // Sukses jika minimal satu channel berhasil (agar tidak retry spam saat satu channel mati)
+    if (!results.some((r) => r.ok)) {
+        throw new Error("Semua channel gagal: " + results.map((r) => `${r.channel}: ${r.error}`).join(" | "));
+    }
+    return results;
+}
+
 async function startBot() {
     try {
         setOrderNotificationsReady(false, "initializing socket");
@@ -633,6 +699,14 @@ async function startBot() {
                 console.log("    Status Code:", statusCode);
                 console.log("    Error:", errorMsg);
 
+                // Notifikasi order via Telegram tetap jalan (independen dari WA).
+                // Beri tahu admin lewat Telegram agar tahu WA sedang mati.
+                // Fire-and-forget: jangan await agar reconnect tidak tertahan.
+                notifyTelegramStatus(
+                    `⚠️ <b>WhatsApp terputus</b> (${statusCode ?? "?"}): ${String(errorMsg || "Unknown error").slice(0, 300)}\n` +
+                    `Notifikasi order tetap dikirim via Telegram.`
+                );
+
                 if (statusCode === DisconnectReason.restartRequired || errorMsg.toLowerCase().includes("restart required")) {
                     console.log("    [*] Restart diperlukan oleh server, reconnect cepat...");
                     setTimeout(() => startBot(), 1500);
@@ -691,6 +765,7 @@ async function startBot() {
                 console.log("\n[*] Bot siap menerima pesan!\n");
                 setBotActivationTime();
                 setOrderNotificationsReady(true, "connection open");
+                notifyTelegramStatus(`✅ <b>WhatsApp reconnected.</b> Notifikasi order kembali dikirim via WA + Telegram.`);
             }
         });
 
@@ -765,7 +840,9 @@ async function startBot() {
                 .channel("public:orders:insert")
                 .on("postgres_changes", { event: "INSERT", schema: "public", table: "orders" }, async (payload) => {
                     const s = currentSock;
-                    if (!isOrderNotificationReady()) {
+                    // INSERT hanya logging (notif grup dihandle UPDATE COMPLETED/FAILED),
+                    // tapi jangan skip hanya karena WA mati: Telegram bersifat independen.
+                    if (!isOrderNotificationReady() && !isTelegramReady()) {
                         console.log("[DEBUG] Skipping INSERT notification because bot is not fully active yet");
                         return;
                     }
@@ -792,8 +869,10 @@ async function startBot() {
                 .channel("public:orders:update")
                 .on("postgres_changes", { event: "UPDATE", schema: "public", table: "orders" }, async (payload) => {
                     const s = currentSock;
-                    if (!isOrderNotificationReady()) {
-                        console.log("[DEBUG] Skipping UPDATE notification because bot is not fully active yet");
+                    // Dual-send: lanjut jika SALAH SATU channel siap.
+                    // Sebelumnya hanya cek WA sehingga Telegram ikut mati saat WA logout.
+                    if (!isOrderNotificationReady() && !isTelegramReady()) {
+                        console.log("[DEBUG] Skipping UPDATE notification because bot is not fully active yet (WA & Telegram not ready)");
                         return;
                     }
 
@@ -826,59 +905,18 @@ async function startBot() {
                         const gid = await resolveGroupId(s);
 
                         if (newStatus === "COMPLETED") {
-                            console.log("[DEBUG] Sending COMPLETED message to group:", gid);
-
-                            // Premium apps: hide account details in group
-                            if (isPremiumApp(order)) {
-                                await sendViaCurrent(gid,
-                                    "*PESANAN SELESAI!* ✅\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "Order: *" + order.id + "*\n" +
-                                    "Produk: *" + order.product + "*\n" +
-                                    "Varian: " + (order.variant || "-") + "\n" +
-                                    "WA: " + (order.wa_number || "-") + "\n" +
-                                    "Email: " + (order.email || "-") + "\n" +
-                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                    "_Detail akun dikirim via email._\n" +
-                                    "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
-                                    "Tinggalkan ulasan positif ya Kak!"
-                                );
-                                return;
-                            }
-
-                            const details = order.account_details || {};
-                            const rawItems = details.raw_items || [];
-                            const isH2H = rawItems.some(item => item.order_process === "h2h" || item.order_process === "smm");
-                            const fulfillmentText = formatFulfillmentDetails(order);
-                            const labelDetail = isH2H ? "*DETAIL TRANSAKSI:*" : "*DETAIL AKUN ANDA:*";
-                            const footerMsg = isH2H
-                                ? "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
-                                "Tinggalkan ulasan positif ya Kak!"
-                                : "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "_Jangan share akun ini ke orang lain!_\n" +
-                                "Terima kasih sudah berbelanja di *noxarianet store*!\n" +
-                                "Tinggalkan ulasan positif ya Kak!";
-
-                            await sendViaCurrent(gid,
-                                "*PESANAN SELESAI!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "Order: *" + order.id + "*\nProduk: *" + order.product + "*\n" +
-                                "Varian: " + (order.variant || "-") + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                labelDetail + "\n\n" + fulfillmentText + "\n\n" +
-                                "WA: " + (order.wa_number || "-") + "\n" +
-                                "Email: " + (order.email || "-") + "\n\n" +
-                                footerMsg
-                            );
+                            console.log("[DEBUG] Sending COMPLETED message (WA + Telegram):", gid);
+                            // Satu sumber format (lib/messages.js) -> WA text + Telegram HTML.
+                            // Premium apps otomatis menyembunyikan detail akun di grup.
+                            const { waText, tgHtml, kind } = buildCompletedMessage(order);
+                            await notifyDual({ waJid: gid, waText, tgHtml, orderId: order.id, kind: `COMPLETED/${kind}` });
                             return;
                         }
 
                         if (newStatus === "FAILED") {
-                            console.log("[DEBUG] Sending FAILED message to group:", gid);
-                            await sendViaCurrent(gid,
-                                "*ORDER GAGAL!*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-                                "ID: *" + order.id + "*\n" + order.product + "\n" +
-                                "WA: " + (order.wa_number || "-") + "\n" +
-                                "Error: _" + (order.error_message || "Unknown") + "_\n*Perlu pengecekan manual!*"
-                            );
+                            console.log("[DEBUG] Sending FAILED message (WA + Telegram):", gid);
+                            const { waText, tgHtml } = buildFailedMessage(order);
+                            await notifyDual({ waJid: gid, waText, tgHtml, orderId: order.id, kind: "FAILED" });
                             return;
                         }
                     } catch (err) {
