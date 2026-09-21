@@ -371,18 +371,17 @@ function formatFulfillmentDetails(order) {
 }
 
 /**
- * Detects if an order is a "premium app" (non-H2H, non-Fincloud auto product)
+ * Detects if an order is a "premium app" (non-H2H auto product)
  * that should NOT have account details shown in group messages.
  *
  * Premium apps have raw_items with order_process like "auto" and contain
- * licenses with credentials. Fincloud orders have "rrn" at root level.
+ * licenses with credentials.
  * H2H/SMM orders have order_process "h2h" or "smm".
  */
 function isPremiumApp(order) {
     const details = order.account_details || {};
 
-    // Fincloud orders have "rrn" at root level of account_details
-    if (details.rrn) return false;
+    if (details.rrn || details.sn) return false;
 
     const rawItems = details.raw_items || [];
     if (rawItems.length === 0) return false;
