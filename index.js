@@ -27,7 +27,7 @@ const {
     logStatus: logTelegramStatus,
     notifyTelegramStatus,
 } = require("./lib/telegram");
-const { buildCompletedMessage, buildFailedMessage } = require("./lib/messages");
+const { buildCompletedMessage, buildFailedMessage, buildNewTicketMessage } = require("./lib/messages");
 
 // =============================================
 // KONFIGURASI SESI & LOGIN
@@ -183,6 +183,7 @@ let cachedGroupId = null;
 let orderNotificationsReady = false;
 let botActivationTime = null;
 const notifiedOrderIds = new Set();
+const notifiedTicketIds = new Set();
 
 function setOrderNotificationsReady(isReady, reason = "") {
     orderNotificationsReady = isReady;
@@ -925,6 +926,55 @@ async function startBot() {
                     }
                 })
                 .subscribe((status) => console.log("[*] Realtime [UPDATE]: " + status));
+
+            // =============================================
+            // TIKET BANTUAN CS - INSERT
+            // Notifikasi grup admin (WA + Telegram) saat tiket baru dibuat.
+            // =============================================
+            supabase
+                .channel("public:tickets:insert")
+                .on("postgres_changes", { event: "INSERT", schema: "public", table: "tickets" }, async (payload) => {
+                    // Dual-send: lanjut jika SALAH SATU channel siap.
+                    if (!isOrderNotificationReady() && !isTelegramReady()) {
+                        console.log("[DEBUG] Skipping ticket notification because bot is not fully active yet");
+                        return;
+                    }
+
+                    const ticket = payload.new;
+                    if (!ticket || !ticket.ticket_number) return;
+                    if (notifiedTicketIds.has(ticket.id)) return;
+
+                    // Tiket backlog (dibuat sebelum bot aktif) diabaikan, pola sama
+                    // dengan isOrderEligibleForCurrentRun.
+                    const created = ticket.created_at ? new Date(ticket.created_at) : null;
+                    if (!created || Number.isNaN(created.getTime())) return;
+                    if (botActivationTime && created.getTime() <= new Date(botActivationTime).getTime()) {
+                        console.log("[DEBUG] Skipping old ticket:", ticket.ticket_number);
+                        return;
+                    }
+
+                    notifiedTicketIds.add(ticket.id);
+
+                    try {
+                        // Pesan pertama tersimpan di tabel terpisah — ambil untuk preview.
+                        const { data: firstMessage } = await supabase
+                            .from("ticket_messages")
+                            .select("body, created_at")
+                            .eq("ticket_id", ticket.id)
+                            .order("created_at", { ascending: true })
+                            .limit(1)
+                            .maybeSingle();
+
+                        const gid = await resolveGroupId(currentSock);
+                        const { waText, tgHtml } = buildNewTicketMessage(ticket, firstMessage);
+                        console.log("[DEBUG] Sending new ticket notification (WA + Telegram):", ticket.ticket_number);
+                        await notifyDual({ waJid: gid, waText, tgHtml, orderId: ticket.ticket_number, kind: "TICKET" });
+                    } catch (err) {
+                        notifiedTicketIds.delete(ticket.id);
+                        console.error("[!] [Realtime] Gagal notif tiket " + ticket.ticket_number + ":", err.message);
+                    }
+                })
+                .subscribe((status) => console.log("[*] Realtime [TICKETS]: " + status));
         }
 
     } catch (err) {
