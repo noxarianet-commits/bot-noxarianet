@@ -103,6 +103,18 @@ Saat ada data order baru masuk ke tabel `orders`, bot akan:
 
 Jika order memiliki `proof_image`, bot akan mencoba mengirim gambar tersebut beserta caption. Jika gagal mengambil gambar, bot akan mengirim teks biasa.
 
+## Keterangan Refund di Notifikasi Order Gagal
+
+Saat order berubah menjadi `FAILED`, bot mengecek apakah saldo pembeli sudah dikembalikan, lalu menampilkan keterangannya di pesan grup (WhatsApp + Telegram).
+
+- Refund ke saldo hanya berlaku untuk order dengan `payment_type = 'balance'` **dan** `user_id` terisi. Order gateway tidak pernah memotong saldo, jadi tidak ada baris refund yang ditampilkan.
+- Sumber kebenaran adalah tabel `balance_transactions` (`type = 'refund'`, `reference_id = orders.id`, `status = 'completed'`), bukan tebakan dari status order.
+- Backend menulis status `FAILED` lebih dulu, baru memanggil refund. Karena itu bot mengulang pengecekan beberapa kali (maks ±3,5 detik) sebelum menyimpulkan hasilnya.
+- Hasil yang mungkin muncul:
+  - `REFUND SALDO ✅` — saldo sudah dikembalikan, lengkap dengan nominal dan waktu refund (WIB).
+  - `REFUND SALDO ⏳` — order saldo tapi bukti refund belum ada (mis. order tertahan di `REFUND_PENDING`); admin perlu cek riwayat saldo user.
+- Kalau pengecekan gagal (mis. koneksi Supabase bermasalah), notifikasi order tetap dikirim dan kesalahan hanya dicatat di log bot.
+
 ## Event Supabase Yang Bisa Dimanfaatkan
 
 Bot ini saat ini menggunakan `postgres_changes` dari `Supabase Realtime`.

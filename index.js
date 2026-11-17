@@ -28,6 +28,7 @@ const {
     notifyTelegramStatus,
 } = require("./lib/telegram");
 const { buildCompletedMessage, buildFailedMessage, buildNewTicketMessage } = require("./lib/messages");
+const { resolveRefundInfo } = require("./lib/refund");
 
 // =============================================
 // KONFIGURASI SESI & LOGIN
@@ -916,8 +917,12 @@ async function startBot() {
 
                         if (newStatus === "FAILED") {
                             console.log("[DEBUG] Sending FAILED message (WA + Telegram):", gid);
-                            const { waText, tgHtml } = buildFailedMessage(order);
-                            await notifyDual({ waJid: gid, waText, tgHtml, orderId: order.id, kind: "FAILED" });
+                            // Cek bukti refund saldo (balance_transactions) sebelum
+                            // menyusun pesan. Order saldo yang gagal otomatis
+                            // direfund backend; tampilkan keterangannya di grup.
+                            const refund = await resolveRefundInfo(supabase, order);
+                            const { waText, tgHtml, kind } = buildFailedMessage(order, refund);
+                            await notifyDual({ waJid: gid, waText, tgHtml, orderId: order.id, kind: `FAILED/${kind}` });
                             return;
                         }
                     } catch (err) {
