@@ -882,10 +882,10 @@ async function startBot() {
                     const newStatus = orderPayload.status;
 
                     // =============================================
-                    // HANYA PROSES COMPLETED DAN FAILED
+                    // PROSES COMPLETED, FAILED, DAN REFUNDED
                     // =============================================
-                    if (newStatus !== "COMPLETED" && newStatus !== "FAILED") {
-                        console.log(`[DEBUG] Skipping status: ${newStatus} (hanya COMPLETED/FAILED)`);
+                    if (!["COMPLETED", "FAILED", "REFUNDED"].includes(newStatus)) {
+                        console.log(`[DEBUG] Skipping status: ${newStatus} (hanya COMPLETED/FAILED/REFUNDED)`);
                         return;
                     }
 
@@ -915,14 +915,21 @@ async function startBot() {
                             return;
                         }
 
-                        if (newStatus === "FAILED") {
-                            console.log("[DEBUG] Sending FAILED message (WA + Telegram):", gid);
+                        if (newStatus === "FAILED" || newStatus === "REFUNDED") {
+                            console.log(`[DEBUG] Sending ${newStatus} message (WA + Telegram):`, gid);
                             // Cek bukti refund saldo (balance_transactions) sebelum
-                            // menyusun pesan. Order saldo yang gagal otomatis
+                            // menyusun pesan. Order saldo/QRIS yang gagal otomatis
                             // direfund backend; tampilkan keterangannya di grup.
                             const refund = await resolveRefundInfo(supabase, order);
                             const { waText, tgHtml, kind } = buildFailedMessage(order, refund);
-                            await notifyDual({ waJid: gid, waText, tgHtml, orderId: order.id, kind: `FAILED/${kind}` });
+                            await notifyDual({ waJid: gid, waText, tgHtml, orderId: order.id, kind: `${newStatus}/${kind}` });
+
+                            // Transisi FAILED -> REFUNDED terjadi beberapa saat
+                            // kemudian. Kalau refund sudah terlihat di event FAILED,
+                            // tandai REFUNDED supaya tidak mengirim pesan kedua.
+                            if (newStatus === "FAILED" && refund.refunded) {
+                                notifiedOrderIds.add(order.id + ":REFUNDED");
+                            }
                             return;
                         }
                     } catch (err) {
